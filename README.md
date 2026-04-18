@@ -1,4 +1,4 @@
-# Vosper Web — v8
+# Auris
 
 > **Speech Intelligence Pipeline**: Upload a video/audio file or record live, and get a dual transcription (Vosk + faster-whisper) with voice-activity detection powered by MarbleNet.
 
@@ -54,13 +54,6 @@ vosper/
 │   ├── audio.py                  ← FFmpeg audio extraction + WAV/PCM helpers
 │   ├── vad.py                    ← MarbleNet VAD — batched ONNX inference
 │   └── transcribe.py             ← Vosk + faster-whisper transcription engines
-│
-├                    ← Single-page web interface
-│   ├── index.html                ← Semantic HTML structure, Tailwind CDN
-│   ├── css/
-│   │   └── style.css             ← Custom styles (what Tailwind can't generate)
-│   └── js/
-│       └── app.js                ← All UI logic: upload, live, dashboard rendering
 │
 ├── scripts/
 │   └── setup_models.py           ← Downloads & verifies all required models
