@@ -1,6 +1,6 @@
 # Auris
 
-> **Speech Intelligence Pipeline**: Upload a video/audio file or record live, and get a dual transcription (Vosk + faster-whisper) with voice-activity detection powered by MarbleNet.
+> **Speech Intelligence Pipeline**: Upload a video/audio file or record live, and get a dual transcription (Vosk + faster-whisper) with voice-activity detection powered by MarbleNet, followed by a Flan-T5 grammar correction layer.
 
 ---
 
@@ -12,11 +12,12 @@
 4. [Prerequisites](#prerequisites)
 5. [Installation](#installation)
 6. [Running the Server](#running-the-server)
-7. [Using the Frontend](#using-the-frontend)
-8. [API Reference](#api-reference)
-9. [Configuration (Environment Variables)](#configuration-environment-variables)
-10. [Frontend Structure](#frontend-structure)
-11. [Model Notes](#model-notes)
+7. [Testing](#testing)
+8. [Using the Frontend](#using-the-frontend)
+9. [API Reference](#api-reference)
+10. [Configuration (Environment Variables)](#configuration-environment-variables)
+11. [Frontend Structure](#frontend-structure)
+12. [Model Notes](#model-notes)
 
 ---
 
@@ -37,6 +38,7 @@
 │    ├── audio.py    — FFmpeg extraction, WAV/PCM helpers         │
 │    ├── vad.py      — MarbleNet VAD (batched ONNX)               │
 │    └── transcribe.py — Vosk + faster-whisper engines            │
+│                        + Flan-T5 correction layer               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -50,10 +52,10 @@ vosper/
 ├── backend/                      ← FastAPI application (Python package)
 │   ├── main.py                   ← App entry point, all HTTP/WS routes
 │   ├── config.py                 ← Settings read from environment variables
-│   ├── models.py                 ← Lazy singleton loaders (Vosk,     Whisper, MarbleNet)
+│   ├── models.py                 ← Lazy singleton loaders (Vosk, Whisper, MarbleNet, Flan-T5)
 │   ├── audio.py                  ← FFmpeg audio extraction + WAV/PCM helpers
 │   ├── vad.py                    ← MarbleNet VAD — batched ONNX inference
-│   └── transcribe.py             ← Vosk + faster-whisper transcription engines
+│   └── transcribe.py             ← Vosk + faster-whisper transcription engines + Flan-T5 correction
 │
 ├── scripts/
 │   └── setup_models.py           ← Downloads & verifies all required models
@@ -97,12 +99,18 @@ User uploads file
       │                      │
       └──────────┬───────────┘
                  ▼
+  [4] Flan-T5 correction  (google/flan-t5-base by default)
+      Takes the Whisper output text, splits it into sentences,
+      corrects grammar and spelling on each sentence,
+      then reassembles into a clean paragraph.
+      Can be disabled with FLAN_ENABLED=false.
+                 │
+                 ▼
            JSON response
-           (vad_segments, vosk, whisper, timing)
+           (vad_segments, vosk, whisper, correction, timing)
 ```
 
-Total latency = t(FFmpeg) + t(VAD) + **max**(t(Vosk), t(Whisper))
-because Vosk and Whisper run concurrently.
+Total latency = t(FFmpeg) + t(VAD) + **max**(t(Vosk), t(Whisper)) + t(Flan-T5)
 
 ### Live mode
 
@@ -116,6 +124,8 @@ Browser mic → AudioWorklet (Float32 → Int16 PCM)
       │   b"__END__" sentinel sent
       ▼
   MarbleNet VAD + faster-whisper  ← run on accumulated buffer
+      │
+  Flan-T5 correction              ← run on Whisper final text
       │
   Final result sent back over WebSocket
 ```
@@ -203,6 +213,111 @@ uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 2
 
 ---
 
+## Testing
+
+### Standard pipeline test (no correction)
+
+Run the server with Flan-T5 disabled, then call the `/transcribe` endpoint directly:
+
+```cmd
+# Windows
+set FLAN_ENABLED=false && uvicorn backend.main:app --reload --port 8000
+```
+
+```bash
+# Linux / macOS
+FLAN_ENABLED=false uvicorn backend.main:app --reload --port 8000
+```
+
+Then test with curl (replace `your_audio.mp4` with your file):
+
+```bash
+curl -X POST http://localhost:8000/transcribe \
+  -F "file=@your_audio.mp4"
+```
+
+The response will contain `vosk` and `whisper` results **without** the `correction` field active:
+
+```json
+{
+  "status": "ok",
+  "whisper": { "text": "the weather is vary good today..." },
+  "vosk":    { "text": "the weather is vary good today..." },
+  "correction": { "corrected": "the weather is vary good today...", "enabled": false }
+}
+```
+
+---
+
+### Pipeline test with Flan-T5 correction (default)
+
+Run the server normally — Flan-T5 is **enabled by default**:
+
+```cmd
+uvicorn backend.main:app --reload --port 8000
+```
+
+Then send the same request:
+
+```bash
+curl -X POST http://localhost:8000/transcribe \
+  -F "file=@your_audio.mp4"
+```
+
+The response now includes a `correction` block with the cleaned-up text and its timing:
+
+```json
+{
+  "status": "ok",
+  "whisper":  { "text": "the weather is vary good today..." },
+  "vosk":     { "text": "the weather is vary good today..." },
+  "correction": {
+    "corrected":  "The weather is very good today.",
+    "enabled":    true,
+    "model":      "google/flan-t5-base",
+    "latency_ms": 4200
+  },
+  "timing": {
+    "ffmpeg_ms":     340,
+    "vad_ms":        120,
+    "parallel_ms":   1850,
+    "correction_ms": 4200,
+    "total_ms":      6510
+  }
+}
+```
+
+---
+
+### Flan-T5 standalone test (compare base vs large)
+
+Before integrating, you can benchmark both models on a sample transcription:
+
+```cmd
+pip install transformers torch sentencepiece accelerate
+python test_flan_t5.py
+```
+
+This runs both `flan-t5-base` and `flan-t5-large` across 3 prompt styles on 10 sample sentences and prints a full comparison table of quality and latency. Use the results to decide which model to set via `FLAN_MODEL`.
+
+---
+
+### Switch to flan-t5-large for higher quality
+
+```cmd
+# Windows
+set FLAN_MODEL=google/flan-t5-large && uvicorn backend.main:app --port 8000
+```
+
+```bash
+# Linux / macOS
+FLAN_MODEL=google/flan-t5-large uvicorn backend.main:app --port 8000
+```
+
+> ⚠️ Large is ~800 MB and 3–4x slower than base on CPU. Only recommended if you have a GPU.
+
+---
+
 ## Using the Frontend
 
 ### Upload tab
@@ -278,11 +393,18 @@ Upload a video or audio file. Runs the full pipeline.
       { "word": "hello", "start": 0.27, "conf": 0.98 }
     ]
   },
+  "correction": {
+    "corrected":  "Hello world, this is a test.",
+    "enabled":    true,
+    "model":      "google/flan-t5-base",
+    "latency_ms": 3800
+  },
   "timing": {
-    "ffmpeg_ms": 340,
-    "vad_ms": 120,
-    "parallel_ms": 1850,
-    "total_ms": 2320
+    "ffmpeg_ms":     340,
+    "vad_ms":        120,
+    "parallel_ms":   1850,
+    "correction_ms": 3800,
+    "total_ms":      6110
   }
 }
 ```
@@ -300,7 +422,7 @@ Streaming live transcription.
 | Client → Server | `b"__END__"` | End of recording |
 | Server → Client | `{"type":"partial","text":"…"}` | Vosk partial result |
 | Server → Client | `{"type":"status","msg":"…"}` | Status update |
-| Server → Client | `{"type":"final","whisper":{…},"vad_segments":[…],"vosk_text":"…"}` | Final result |
+| Server → Client | `{"type":"final","whisper":{…},"vad_segments":[…],"vosk_text":"…","correction":{…}}` | Final result with correction |
 | Server → Client | `{"type":"error","msg":"…"}` | Error |
 
 ---
@@ -329,10 +451,29 @@ All settings are in `backend/config.py` and can be overridden via environment va
 | `VAD_MIN_SILENCE_MS` | `200`                                | Minimum silence gap to split in ms   |
 | `FFMPEG_TIMEOUT`     | `120`                                | FFmpeg subprocess timeout in seconds |
 | `ONNX_THREADS`       | `4`                                  | ONNX Runtime CPU threads             |
+| `FLAN_ENABLED`       | `true`                               | Set to `false` to skip correction    |
+| `FLAN_MODEL`         | `google/flan-t5-base`                | Flan-T5 model (`flan-t5-base` or `flan-t5-large`) |
+| `FLAN_MAX_TOKENS`    | `512`                                | Max tokens generated per sentence    |
+| `FLAN_NUM_BEAMS`     | `4`                                  | Beam search width (higher = better quality, slower) |
 
 **Example — use a larger Whisper model:**
 ```bash
 WHISPER_MODEL=medium.en uvicorn backend.main:app --port 8000
+```
+
+**Example — disable Flan-T5 correction:**
+```cmd
+# Windows
+set FLAN_ENABLED=false && uvicorn backend.main:app --port 8000
+```
+```bash
+# Linux / macOS
+FLAN_ENABLED=false uvicorn backend.main:app --port 8000
+```
+
+**Example — switch to flan-t5-large:**
+```bash
+FLAN_MODEL=google/flan-t5-large uvicorn backend.main:app --port 8000
 ```
 
 ---
@@ -371,9 +512,14 @@ frontend/
 | Vosk small-en | ~50 MB | Fast real-time speech recognition | [alphacephei.com](https://alphacephei.com/vosk/models) |
 | MarbleNet | ~7 MB | Voice activity detection | [NVIDIA NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/vad_multilingual_frame_marblenet) |
 | Whisper base.en | ~150 MB | High-accuracy transcription | [OpenAI (via faster-whisper)](https://github.com/SYSTRAN/faster-whisper) |
+| Flan-T5 base | ~250 MB | Grammar & spelling correction | [Google (via HuggingFace)](https://huggingface.co/google/flan-t5-base) |
+| Flan-T5 large | ~800 MB | Higher quality correction (slower) | [Google (via HuggingFace)](https://huggingface.co/google/flan-t5-large) |
 
 To use a **larger Whisper model** for better accuracy, set `WHISPER_MODEL` to one of:
 `tiny`, `base`, `small`, `medium`, `large-v3` (append `.en` for English-only variants, e.g. `small.en`).
+
+To use **Flan-T5 large** for better correction quality, set `FLAN_MODEL=google/flan-t5-large`.
+Note that large is ~3–4x slower than base on CPU — a GPU is recommended for production use.
 
 ---
 
@@ -393,3 +539,12 @@ To use a **larger Whisper model** for better accuracy, set `WHISPER_MODEL` to on
 
 **Microphone not working in Live mode**
 → Your browser must be served over HTTPS or `localhost` for `getUserMedia` to work. Running locally on `localhost:8000` is fine.
+
+**Flan-T5 slow on first request**
+→ The model is downloaded from HuggingFace on first use (~250 MB for base). Subsequent runs use the local cache. To pre-download manually:
+```bash
+python -c "from transformers import T5Tokenizer, T5ForConditionalGeneration; T5Tokenizer.from_pretrained('google/flan-t5-base'); T5ForConditionalGeneration.from_pretrained('google/flan-t5-base')"
+```
+
+**Want to skip correction for faster results**
+→ Set `FLAN_ENABLED=false` before starting the server. The `correction` field will still appear in the response but with `"enabled": false` and the original text unchanged.
