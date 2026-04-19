@@ -21,13 +21,9 @@ from pathlib import Path
 VOSK_URL  = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
 VOSK_DIR  = Path("models/vosk/small")
 
-MARBLENET_URL = (
-    "https://api.ngc.nvidia.com/v2/models/org/nvidia/team/nemo/"
-    "vad_multilingual_frame_marblenet/1.20.0/files"
-    "?redirect=true&path=vad_multilingual_frame_marblenet.nemo"
-)
-MARBLENET_DIR  = Path("models/marblenet")
-MARBLENET_FILE = MARBLENET_DIR / "marblenet-vad.nemo"
+SILERO_URL     = "https://github.com/snakers4/silero-vad/raw/v4.0/files/silero_vad.onnx"
+SILERO_DIR  = Path("models/silero_vad")
+SILERO_ONNX = SILERO_DIR / "silero_vad.onnx"
 
 REQUIRED_PACKAGES = {
     "fastapi":        "fastapi",
@@ -122,32 +118,24 @@ def download_vosk() -> None:
     ok(f"Installed at {VOSK_DIR}")
 
 
-def download_marblenet() -> None:
-    MARBLENET_DIR.mkdir(parents=True, exist_ok=True)
+def download_vad() -> None:
+    """Download Silero VAD ONNX — no NeMo or NVIDIA account needed."""
+    SILERO_DIR.mkdir(parents=True, exist_ok=True)
 
-    if MARBLENET_FILE.exists():
-        ok(f"Already installed at {MARBLENET_FILE}")
+    if SILERO_ONNX.exists():
+        ok(f"Already installed at {SILERO_ONNX}")
         return
 
-    print("  Downloading from NVIDIA NGC (~7 MB)…")
+    print("  Downloading Silero VAD ONNX (~2 MB)…")
     try:
-        req = urllib.request.Request(MARBLENET_URL)
-        req.add_header("User-Agent", "Mozilla/5.0")
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            done  = 0
-            with open(MARBLENET_FILE, "wb") as out:
-                while chunk := resp.read(8192):
-                    out.write(chunk)
-                    done += len(chunk)
-                    if total > 0:
-                        progress(1, done, total)
+        urllib.request.urlretrieve(SILERO_URL, SILERO_ONNX, progress)
         print()
-        ok(f"Installed at {MARBLENET_FILE}")
+        size = SILERO_ONNX.stat().st_size / 1024 / 1024
+        ok(f"Installed at {SILERO_ONNX} ({size:.1f} MB)")
     except Exception as exc:
         print()
-        warn(f"Download failed: {exc}")
-        warn("Manual download: https://catalog.ngc.nvidia.com/orgs/nvidia/teams/nemo/models/vad_multilingual_frame_marblenet")
+        err(f"Download failed: {exc}")
+        sys.exit(1)
 
 
 def warmup_whisper() -> None:
@@ -157,7 +145,6 @@ def warmup_whisper() -> None:
 
         model = WhisperModel("base.en", device="cpu", compute_type="int8")
 
-        # Create a tiny silent WAV for the warmup pass
         silence = np.zeros(16_000, dtype=np.int16)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
@@ -181,7 +168,7 @@ def warmup_whisper() -> None:
 
 def main() -> None:
     header("Vosper — Model Setup")
-    print("  Pipeline:  FFmpeg → MarbleNet VAD → Vosk ∥ faster-whisper")
+    print("  Pipeline:  FFmpeg → Silero VAD → Vosk ∥ faster-whisper")
 
     check_python()
 
@@ -195,8 +182,8 @@ def main() -> None:
     step(3, TOTAL, "Vosk small-en model")
     download_vosk()
 
-    step(4, TOTAL, "MarbleNet VAD (NVIDIA NGC)")
-    download_marblenet()
+    step(4, TOTAL, "Silero VAD ONNX")
+    download_vad()
 
     step(5, TOTAL, "faster-whisper warmup")
     warmup_whisper()

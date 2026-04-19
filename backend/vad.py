@@ -1,8 +1,7 @@
-"""Vosper — MarbleNet VAD (batched ONNX)"""
+"""Vosper — Silero VAD (stateful ONNX)"""
 import io
 import logging
 
-import librosa
 import numpy as np
 
 from . import config
@@ -14,6 +13,9 @@ log = logging.getLogger("vosper.vad")
 # Fallback when model is unavailable
 _PASSTHROUGH = [{"start": 0.0, "end": 9999.0, "confidence": 1.0}]
 
+# Silero requires exactly 512 samples per chunk at 16 kHz
+CHUNK_SIZE = 512
+
 
 def run_vad(
     wav_bytes: bytes,
@@ -23,7 +25,7 @@ def run_vad(
     min_silence_ms: int = config.VAD_MIN_SILENCE_MS,
 ) -> tuple[list[dict], bytes]:
     """
-    Run MarbleNet VAD over wav_bytes.
+    Run Silero VAD over wav_bytes.
 
     Returns:
         (segments, speech_wav)
@@ -34,49 +36,48 @@ def run_vad(
     if session is None:
         return _PASSTHROUGH, wav_bytes
 
-    # ── Load audio ─────────────────────────────────────────────────────────────
+    # ── Load audio as float32 PCM ──────────────────────────────────────────────
     try:
-        audio, _ = librosa.load(io.BytesIO(wav_bytes), sr=sample_rate, mono=True)
+        pcm_bytes, _ = read_wav(wav_bytes)
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     except Exception as exc:
-        log.error("librosa load error: %s — falling back to raw PCM", exc)
-        pcm, _ = read_wav(wav_bytes)
-        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        log.error("audio load error: %s — passthrough", exc)
+        return _PASSTHROUGH, wav_bytes
 
     if len(audio) == 0:
         return [], wav_bytes
 
-    # ── Build frame batch ──────────────────────────────────────────────────────
-    frame_len = int(0.02 * sample_rate)   # 20 ms
-    hop_len   = frame_len
-    starts    = np.arange(0, len(audio) - frame_len + 1, hop_len)
+    # ── Silero stateful inference ──────────────────────────────────────────────
+    # Initialise LSTM hidden states
+    h  = np.zeros((2, 1, 64), dtype=np.float32)
+    c  = np.zeros((2, 1, 64), dtype=np.float32)
+    sr = np.array(sample_rate, dtype=np.int64)
 
-    if len(starts) == 0:
+    speech_probs: list[float] = []
+    starts: list[int] = []
+
+    for start in range(0, len(audio) - CHUNK_SIZE + 1, CHUNK_SIZE):
+        chunk = audio[start : start + CHUNK_SIZE].reshape(1, -1)  # (1, 512)
+
+        out, h, c = session.run(
+            ["output", "hn", "cn"],
+            {"input": chunk, "sr": sr, "h": h, "c": c},
+        )
+
+        speech_probs.append(float(out[0][0]))
+        starts.append(start)
+
+    if not speech_probs:
         return [], wav_bytes
 
-    batch  = np.stack([audio[s : s + frame_len] for s in starts]).astype(np.float32)
-    means  = batch.mean(axis=1, keepdims=True)
-    stds   = batch.std(axis=1, keepdims=True) + 1e-8
-    batch  = (batch - means) / stds
-
-    # ── ONNX inference ─────────────────────────────────────────────────────────
-    input_name = session.get_inputs()[0].name
-    try:
-        outputs      = session.run(None, {input_name: batch})
-        speech_probs = outputs[0][:, 1].tolist()
-    except Exception:
-        # Frame-by-frame fallback when batched shape is rejected
-        speech_probs = []
-        for frame in batch:
-            out = session.run(None, {input_name: frame.reshape(1, -1)})
-            speech_probs.append(float(out[0][0][1]))
-
-    # ── Frames → raw segments ──────────────────────────────────────────────────
+    # ── Probs → segments ───────────────────────────────────────────────────────
     segments: list[dict] = []
     current: dict | None = None
+    chunk_dur = CHUNK_SIZE / sample_rate          # seconds per chunk
 
-    for s, prob in zip(starts, speech_probs):
-        t_start = float(s) / sample_rate
-        t_end   = float(s + frame_len) / sample_rate
+    for start_sample, prob in zip(starts, speech_probs):
+        t_start = start_sample / sample_rate
+        t_end   = t_start + chunk_dur
 
         if prob > threshold:
             if current is None:
@@ -98,7 +99,7 @@ def run_vad(
 
     # ── Extract speech PCM ─────────────────────────────────────────────────────
     full_pcm = np.frombuffer(read_wav(wav_bytes)[0], dtype=np.int16)
-    pad      = int(0.1 * sample_rate)   # 100 ms padding around each segment
+    pad      = int(0.1 * sample_rate)
     parts    = []
 
     for seg in segments:

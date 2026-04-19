@@ -4,8 +4,7 @@ import os
 # ── Model paths ────────────────────────────────────────────────────────────────
 VOSK_PATH       = os.environ.get("VOSK_MODEL_PATH",  "models/vosk/small")
 WHISPER_MODEL   = os.environ.get("WHISPER_MODEL",    "base.en")
-MARBLENET_PATH  = os.environ.get("MARBLENET_PATH",   "models/marblenet/marblenet-vad.onnx")
-
+MARBLENET_PATH = os.environ.get("MARBLENET_PATH", "models/silero_vad/silero_vad.onnx")
 # ── Whisper settings ───────────────────────────────────────────────────────────
 WHISPER_BEAM_SIZE   = int(os.environ.get("WHISPER_BEAM_SIZE",   "1"))
 WHISPER_LANGUAGE    = os.environ.get("WHISPER_LANGUAGE",        "en")
