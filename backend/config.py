@@ -24,3 +24,11 @@ ONNX_THREADS = int(os.environ.get("ONNX_THREADS", "4"))
 # ── FFmpeg settings ────────────────────────────────────────────────────────────
 FFMPEG_TIMEOUT  = int(os.environ.get("FFMPEG_TIMEOUT",  "120"))
 FFMPEG_THREADS  = int(os.environ.get("FFMPEG_THREADS",  "4"))
+
+# ── Flan-T5 correction layer ───────────────────────────────────────────────────
+# Set FLAN_ENABLED=false to disable the correction layer entirely.
+# Set FLAN_MODEL to "google/flan-t5-large" for higher quality (slower).
+FLAN_ENABLED    = os.environ.get("FLAN_ENABLED",  "true").lower() == "true"
+FLAN_MODEL      = os.environ.get("FLAN_MODEL",    "google/flan-t5-base")
+FLAN_MAX_TOKENS = int(os.environ.get("FLAN_MAX_TOKENS", "512"))
+FLAN_NUM_BEAMS  = int(os.environ.get("FLAN_NUM_BEAMS",  "4"))

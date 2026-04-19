@@ -7,7 +7,7 @@ import tempfile
 import vosk
 
 from .audio import read_wav
-from .models import load_vosk, load_whisper
+from .models import load_vosk, load_whisper, load_flan
 from . import config
 
 log = logging.getLogger("vosper.transcribe")
@@ -104,4 +104,82 @@ def transcribe_whisper(wav_bytes: bytes) -> dict:
         "text":       text,
         "word_count": len(text.split()) if text else 0,
         "segments":   segments,
+    }
+
+
+# ── Flan-T5 correction layer ───────────────────────────────────────────────────
+
+def correct_text(text: str) -> dict:
+    """
+    Run Flan-T5 correction on a transcription text.
+
+    Splits the text into sentences, corrects each one individually,
+    then reassembles into a clean paragraph.
+
+    Returns:
+        {
+            "corrected":   <full corrected text as a string>,
+            "enabled":     <bool — False if FLAN_ENABLED=false>,
+            "model":       <model name used>,
+            "latency_ms":  <total correction time in ms>,
+        }
+    """
+    import time
+
+    if not config.FLAN_ENABLED:
+        return {"corrected": text, "enabled": False, "model": None, "latency_ms": 0}
+
+    if not text or not text.strip():
+        return {"corrected": text, "enabled": True, "model": config.FLAN_MODEL, "latency_ms": 0}
+
+    model, tokenizer = load_flan()
+    if model is None or tokenizer is None:
+        return {"corrected": text, "enabled": False, "model": None, "latency_ms": 0}
+
+    import torch
+    device = next(model.parameters()).device
+
+    # Split into sentences on period boundaries
+    sentences = [s.strip() for s in text.split(".") if s.strip()]
+    if not sentences:
+        return {"corrected": text, "enabled": True, "model": config.FLAN_MODEL, "latency_ms": 0}
+
+    t_start = time.perf_counter()
+    corrected_parts: list[str] = []
+
+    for sentence in sentences:
+        prompt = f"Rewrite this with correct grammar and spelling: {sentence}"
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=config.FLAN_MAX_TOKENS,
+                num_beams=config.FLAN_NUM_BEAMS,
+                early_stopping=True,
+                no_repeat_ngram_size=3,
+            )
+
+        result = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Strip trailing period added by the model so we can rejoin cleanly
+        corrected_parts.append(result.rstrip(".").strip())
+
+    latency_ms = round((time.perf_counter() - t_start) * 1000)
+    corrected_text = ". ".join(corrected_parts) + "."
+
+    log.info(
+        "Flan-T5 correction done — %d sentences | %dms",
+        len(sentences), latency_ms,
+    )
+
+    return {
+        "corrected":  corrected_text,
+        "enabled":    True,
+        "model":      config.FLAN_MODEL,
+        "latency_ms": latency_ms,
     }

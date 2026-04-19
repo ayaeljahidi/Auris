@@ -13,8 +13,8 @@ from fastapi.staticfiles import StaticFiles
 import vosk
 
 from .audio import extract_audio, read_wav, pcm_to_wav, audio_duration_seconds
-from .models import load_vosk, load_whisper, load_marblenet, health_status
-from .transcribe import transcribe_vosk, transcribe_whisper
+from .models import load_vosk, load_whisper, load_marblenet, load_flan, health_status
+from .transcribe import transcribe_vosk, transcribe_whisper, correct_text
 from .vad import run_vad
 
 logging.basicConfig(
@@ -47,6 +47,7 @@ async def on_startup() -> None:
         (load_vosk,      "Vosk"),
         (load_whisper,   "faster-whisper"),
         (load_marblenet, "MarbleNet VAD"),
+        (load_flan,      "Flan-T5"),
     ]:
         try:
             await loop.run_in_executor(None, loader)
@@ -111,11 +112,20 @@ async def transcribe(file: UploadFile = File(...)):
             status_code=500,
         )
     t_parallel = _ms(t2)
-    t_total    = _ms(t_start)
+
+    # 4 · Flan-T5 correction ---------------------------------------------------
+    t3 = time.perf_counter()
+    loop = asyncio.get_event_loop()
+    correction = await loop.run_in_executor(
+        None, correct_text, whisper_result["text"]
+    )
+    t_correction = _ms(t3)
+
+    t_total = _ms(t_start)
 
     log.info(
-        "Done — ffmpeg:%dms  vad:%dms  parallel:%dms  total:%dms",
-        t_ffmpeg, t_vad, t_parallel, t_total,
+        "Done — ffmpeg:%dms  vad:%dms  parallel:%dms  correction:%dms  total:%dms",
+        t_ffmpeg, t_vad, t_parallel, t_correction, t_total,
     )
 
     return {
@@ -125,11 +135,13 @@ async def transcribe(file: UploadFile = File(...)):
         "vad_segments": vad_segments,
         "vosk":         vosk_result,
         "whisper":      whisper_result,
+        "correction":   correction,
         "timing": {
-            "ffmpeg_ms":   t_ffmpeg,
-            "vad_ms":      t_vad,
-            "parallel_ms": t_parallel,
-            "total_ms":    t_total,
+            "ffmpeg_ms":     t_ffmpeg,
+            "vad_ms":        t_vad,
+            "parallel_ms":   t_parallel,
+            "correction_ms": t_correction,
+            "total_ms":      t_total,
         },
     }
 
@@ -174,21 +186,27 @@ async def ws_live(ws: WebSocket) -> None:
                         whisper_r  = await loop.run_in_executor(
                             None, transcribe_whisper, speech_wav
                         )
+                        correction = await loop.run_in_executor(
+                            None, correct_text, whisper_r["text"]
+                        )
                     except Exception as exc:
                         log.error("Live final error: %s", exc)
-                        whisper_r = {"text": "", "word_count": 0, "segments": []}
-                        vad_segs  = []
-                        vosk_text = ""
+                        whisper_r  = {"text": "", "word_count": 0, "segments": []}
+                        vad_segs   = []
+                        vosk_text  = ""
+                        correction = {"corrected": "", "enabled": False, "model": None, "latency_ms": 0}
                 else:
-                    whisper_r = {"text": "", "word_count": 0, "segments": []}
-                    vad_segs  = []
-                    vosk_text = ""
+                    whisper_r  = {"text": "", "word_count": 0, "segments": []}
+                    vad_segs   = []
+                    vosk_text  = ""
+                    correction = {"corrected": "", "enabled": False, "model": None, "latency_ms": 0}
 
                 await ws.send_json({
                     "type":         "final",
                     "whisper":      whisper_r,
                     "vad_segments": vad_segs,
                     "vosk_text":    vosk_text,
+                    "correction":   correction,
                 })
                 break
 
