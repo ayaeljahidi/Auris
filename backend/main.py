@@ -1,6 +1,5 @@
-"""Vosper Web — FastAPI application entry point"""
+"""Auris — FastAPI application entry point"""
 import asyncio
-import json
 import logging
 import time
 from pathlib import Path
@@ -10,22 +9,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-import vosk
-
 from .audio import extract_audio, read_wav, pcm_to_wav, audio_duration_seconds
-from .models import load_vosk, load_whisper, load_marblenet, load_flan, health_status
-from .transcribe import transcribe_vosk, transcribe_whisper, correct_text
+from .models import load_whisper, load_silero, load_flan, health_status
+from .transcribe import (
+    transcribe_whisper,
+    transcribe_whisper_with_correction,
+    correct_text,
+)
 from .vad import run_vad
+from . import config
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  [%(levelname)-8s]  %(name)s — %(message)s",
 )
-log = logging.getLogger("vosper")
+log = logging.getLogger("auris")
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Vosper Web API", version="8.0", docs_url="/api/docs")
+app = FastAPI(title="Auris API", version="9.0", docs_url="/api/docs")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,14 +42,13 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    """Pre-load all models in the background so the first request is fast."""
+    """Pre-load all models in background threads so the first request is fast."""
     loop = asyncio.get_event_loop()
     log.info("Pre-loading models…")
     for loader, name in [
-        (load_vosk,      "Vosk"),
-        (load_whisper,   "faster-whisper"),
-        (load_marblenet, "MarbleNet VAD"),
-        (load_flan,      "Flan-T5"),
+        (load_whisper, "faster-whisper"),
+        (load_silero,  "Silero VAD"),
+        (load_flan,    "Flan-T5"),
     ]:
         try:
             await loop.run_in_executor(None, loader)
@@ -60,7 +61,7 @@ async def on_startup() -> None:
 
 @app.get("/health", tags=["system"])
 async def health() -> dict:
-    return {"status": "ok", "version": "8.0", **health_status()}
+    return {"status": "ok", "version": "9.0", **health_status()}
 
 
 # ── Transcribe (file upload) ───────────────────────────────────────────────────
@@ -68,13 +69,16 @@ async def health() -> dict:
 @app.post("/transcribe", tags=["transcription"])
 async def transcribe(file: UploadFile = File(...)):
     """
-    Full pipeline:  upload → FFmpeg → MarbleNet VAD → Vosk ∥ Whisper
+    Full pipeline:  upload → FFmpeg → Silero VAD → Whisper + Flan-T5
 
-    Total latency = t(FFmpeg) + t(VAD) + max(t(Vosk), t(Whisper))
+    Total latency = t(FFmpeg) + t(Silero VAD) + t(Whisper + Flan-T5)
     """
     t_start   = time.perf_counter()
     raw_bytes = await file.read()
     log.info("Received '%s'  (%d KB)", file.filename, len(raw_bytes) // 1024)
+
+    # Retrieve event loop once and reuse throughout the handler
+    loop = asyncio.get_event_loop()
 
     # 1 · FFmpeg ----------------------------------------------------------------
     t0 = time.perf_counter()
@@ -85,11 +89,11 @@ async def transcribe(file: UploadFile = File(...)):
             {"status": "error", "message": f"Audio extraction failed: {exc}"},
             status_code=422,
         )
-    pcm, sr    = read_wav(wav_bytes)
-    duration   = audio_duration_seconds(pcm, sr)
-    t_ffmpeg   = _ms(t0)
+    pcm, sr  = read_wav(wav_bytes)
+    duration = audio_duration_seconds(pcm, sr)
+    t_ffmpeg = _ms(t0)
 
-    # 2 · VAD ------------------------------------------------------------------
+    # 2 · Silero VAD -----------------------------------------------------------
     t1 = time.perf_counter()
     try:
         vad_segments, speech_wav = run_vad(wav_bytes, sr)
@@ -98,34 +102,24 @@ async def transcribe(file: UploadFile = File(...)):
         vad_segments, speech_wav = [], wav_bytes
     t_vad = _ms(t1)
 
-    # 3 · Vosk + Whisper in parallel -------------------------------------------
-    t2   = time.perf_counter()
-    loop = asyncio.get_event_loop()
+    # 3 · Whisper + Flan-T5 (segment-level streaming parallelism) --------------
+    t2 = time.perf_counter()
     try:
-        vosk_result, whisper_result = await asyncio.gather(
-            loop.run_in_executor(None, transcribe_vosk,    speech_wav),
-            loop.run_in_executor(None, transcribe_whisper, speech_wav),
+        whisper_result, correction = await loop.run_in_executor(
+            None, transcribe_whisper_with_correction, speech_wav
         )
     except Exception as exc:
         return JSONResponse(
             {"status": "error", "message": f"Transcription failed: {exc}"},
             status_code=500,
         )
-    t_parallel = _ms(t2)
-
-    # 4 · Flan-T5 correction ---------------------------------------------------
-    t3 = time.perf_counter()
-    loop = asyncio.get_event_loop()
-    correction = await loop.run_in_executor(
-        None, correct_text, whisper_result["text"]
-    )
-    t_correction = _ms(t3)
+    t_whisper = _ms(t2)
 
     t_total = _ms(t_start)
 
     log.info(
-        "Done — ffmpeg:%dms  vad:%dms  parallel:%dms  correction:%dms  total:%dms",
-        t_ffmpeg, t_vad, t_parallel, t_correction, t_total,
+        "Done — ffmpeg:%dms  vad:%dms  whisper+flan:%dms  total:%dms",
+        t_ffmpeg, t_vad, t_whisper, t_total,
     )
 
     return {
@@ -133,15 +127,13 @@ async def transcribe(file: UploadFile = File(...)):
         "filename":     file.filename,
         "duration_sec": round(duration, 2),
         "vad_segments": vad_segments,
-        "vosk":         vosk_result,
         "whisper":      whisper_result,
         "correction":   correction,
         "timing": {
-            "ffmpeg_ms":     t_ffmpeg,
-            "vad_ms":        t_vad,
-            "parallel_ms":   t_parallel,
-            "correction_ms": t_correction,
-            "total_ms":      t_total,
+            "ffmpeg_ms":   t_ffmpeg,
+            "vad_ms":      t_vad,
+            "whisper_ms":  t_whisper,
+            "total_ms":    t_total,
         },
     }
 
@@ -151,71 +143,87 @@ async def transcribe(file: UploadFile = File(...)):
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket) -> None:
     """
-    Live recording endpoint.
+    Live recording endpoint with configurable idle timeout.
 
     Protocol:
       client  →  raw 16-bit mono PCM chunks (16 kHz)
-      client  →  b"__END__"          (signals end of recording)
-      server  →  {"type":"partial",  "text": …}
-      server  →  {"type":"final",    "whisper": …, "vad_segments": …, "vosk_text": …}
-      server  →  {"type":"error",    "msg": …}
-      server  →  {"type":"status",   "msg": …}
+      client  →  b"__END__"           (signals end of recording)
+      server  →  {"type":"partial",   "text": "Recording… speak now"}
+      server  →  {"type":"status",    "msg": …}
+      server  →  {"type":"final",     "whisper": …, "vad_segments": […], "correction": …}
+      server  →  {"type":"error",     "msg": …}
     """
     await ws.accept()
     log.info("Live WebSocket connected")
 
-    rec = vosk.KaldiRecognizer(load_vosk(), 16_000)
-    rec.SetWords(True)
     pcm_buffer = bytearray()
+    loop       = asyncio.get_event_loop()
 
     try:
         while True:
-            data = await ws.receive_bytes()
+            # Timeout guard — close zombie connections that never send __END__
+            try:
+                data = await asyncio.wait_for(
+                    ws.receive_bytes(),
+                    timeout=config.WS_LIVE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.warning("Live WebSocket timed out after %ds",
+                            config.WS_LIVE_TIMEOUT)
+                try:
+                    await ws.send_json({"type": "error", "msg": "Recording timeout"})
+                except Exception:
+                    pass
+                await ws.close()
+                return
 
             # ── End-of-recording sentinel ──────────────────────────────────────
             if data == b"__END__":
-                await ws.send_json({"type": "status", "msg": "Running VAD + Whisper…"})
+                await ws.send_json({"type": "status", "msg": "Running Silero VAD + Whisper…"})
                 full_wav = pcm_to_wav(bytes(pcm_buffer), 16_000)
 
                 if len(pcm_buffer) > 3_200:   # > 0.1 s of audio
-                    loop = asyncio.get_event_loop()
                     try:
                         vad_segs, speech_wav = run_vad(full_wav, 16_000)
-                        vosk_final = json.loads(rec.FinalResult())
-                        vosk_text  = vosk_final.get("text", "")
-                        whisper_r  = await loop.run_in_executor(
-                            None, transcribe_whisper, speech_wav
-                        )
-                        correction = await loop.run_in_executor(
-                            None, correct_text, whisper_r["text"]
+                        whisper_r, correction = await loop.run_in_executor(
+                            None, transcribe_whisper_with_correction, speech_wav
                         )
                     except Exception as exc:
                         log.error("Live final error: %s", exc)
                         whisper_r  = {"text": "", "word_count": 0, "segments": []}
                         vad_segs   = []
-                        vosk_text  = ""
-                        correction = {"corrected": "", "enabled": False, "model": None, "latency_ms": 0}
+                        correction = {
+                            "corrected":  "",
+                            "enabled":    False,
+                            "model":      None,
+                            "latency_ms": 0,
+                        }
                 else:
                     whisper_r  = {"text": "", "word_count": 0, "segments": []}
                     vad_segs   = []
-                    vosk_text  = ""
-                    correction = {"corrected": "", "enabled": False, "model": None, "latency_ms": 0}
+                    correction = {
+                        "corrected":  "",
+                        "enabled":    False,
+                        "model":      None,
+                        "latency_ms": 0,
+                    }
 
                 await ws.send_json({
                     "type":         "final",
                     "whisper":      whisper_r,
                     "vad_segments": vad_segs,
-                    "vosk_text":    vosk_text,
                     "correction":   correction,
                 })
                 break
 
-            # ── Streaming partial recognition ──────────────────────────────────
+            # ── Streaming chunk received ───────────────────────────────────────
+            # Vosk real-time partials are removed; send a simple status nudge
+            # so the client knows audio is being received.
             pcm_buffer.extend(data)
-            if rec.AcceptWaveform(bytes(data)):
-                partial = json.loads(rec.Result())
-                if partial.get("text"):
-                    await ws.send_json({"type": "partial", "text": partial["text"]})
+            await ws.send_json({
+                "type": "partial",
+                "text": "Recording… speak now",
+            })
 
     except WebSocketDisconnect:
         log.info("Live WebSocket disconnected")

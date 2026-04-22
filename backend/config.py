@@ -1,10 +1,10 @@
-"""Vosper — Configuration"""
+"""Auris — Configuration"""
 import os
 
 # ── Model paths ────────────────────────────────────────────────────────────────
-VOSK_PATH       = os.environ.get("VOSK_MODEL_PATH",  "models/vosk/small")
 WHISPER_MODEL   = os.environ.get("WHISPER_MODEL",    "base.en")
-MARBLENET_PATH = os.environ.get("MARBLENET_PATH", "models/silero_vad/silero_vad.onnx")
+SILERO_PATH     = os.environ.get("SILERO_PATH",      "models/silero_vad/silero_vad.onnx")
+
 # ── Whisper settings ───────────────────────────────────────────────────────────
 WHISPER_BEAM_SIZE   = int(os.environ.get("WHISPER_BEAM_SIZE",   "1"))
 WHISPER_LANGUAGE    = os.environ.get("WHISPER_LANGUAGE",        "en")
@@ -31,3 +31,7 @@ FLAN_ENABLED    = os.environ.get("FLAN_ENABLED",  "true").lower() == "true"
 FLAN_MODEL      = os.environ.get("FLAN_MODEL",    "google/flan-t5-base")
 FLAN_MAX_TOKENS = int(os.environ.get("FLAN_MAX_TOKENS", "512"))
 FLAN_NUM_BEAMS  = int(os.environ.get("FLAN_NUM_BEAMS",  "4"))
+
+# ── WebSocket settings ─────────────────────────────────────────────────────────
+# WS_LIVE_TIMEOUT: seconds before an idle live WebSocket is closed automatically.
+WS_LIVE_TIMEOUT = int(os.environ.get("WS_LIVE_TIMEOUT", "300"))

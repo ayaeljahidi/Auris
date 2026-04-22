@@ -1,16 +1,15 @@
-"""Vosper — Silero VAD (stateful ONNX)"""
-import io
+"""Auris — Silero VAD (stateful ONNX)"""
 import logging
 
 import numpy as np
 
 from . import config
 from .audio import read_wav, pcm_to_wav
-from .models import load_marblenet
+from .models import load_silero
 
-log = logging.getLogger("vosper.vad")
+log = logging.getLogger("auris.vad")
 
-# Fallback when model is unavailable
+# Fallback when Silero VAD model is unavailable
 _PASSTHROUGH = [{"start": 0.0, "end": 9999.0, "confidence": 1.0}]
 
 # Silero requires exactly 512 samples per chunk at 16 kHz
@@ -30,9 +29,9 @@ def run_vad(
     Returns:
         (segments, speech_wav)
         segments   — list of {"start", "end", "confidence"}
-        speech_wav — WAV bytes containing only speech regions
+        speech_wav — WAV bytes containing only detected speech regions
     """
-    session = load_marblenet()
+    session = load_silero()
     if session is None:
         return _PASSTHROUGH, wav_bytes
 
@@ -109,7 +108,7 @@ def run_vad(
             parts.append(full_pcm[s:e])
 
     speech_pcm = np.concatenate(parts).tobytes() if parts else full_pcm.tobytes()
-    log.info("VAD: %d speech segment(s) detected", len(segments))
+    log.info("Silero VAD: %d speech segment(s) detected", len(segments))
     return segments, pcm_to_wav(speech_pcm, sample_rate)
 
 

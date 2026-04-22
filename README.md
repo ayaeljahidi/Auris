@@ -159,7 +159,7 @@ choco install ffmpeg    # or download from https://ffmpeg.org/download.html
 ### 1 — Clone / download the project
 
 ```bash
-cd vosper
+cd backend
 ```
 
 ### 2 — Create a virtual environment (recommended)
