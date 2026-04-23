@@ -175,11 +175,7 @@ source .venv/bin/activate      # Linux / macOS
 ```bash
 pip install -r requirements.txt
 ```
-
-> **GPU note:** If you have an NVIDIA GPU, install the CUDA version of PyTorch before installing requirements:
-> ```bash
-> pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
-> ```
+``
 
 ### 4 — Download models
 

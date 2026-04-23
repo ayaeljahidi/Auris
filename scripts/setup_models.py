@@ -1,5 +1,5 @@
 """
-Vosper — Model Setup Script
+Auris — Model Setup Script (CPU-only, FFmpeg-free, VAD-free)
 Downloads and verifies all required models and dependencies.
 
 Usage:
@@ -7,33 +7,29 @@ Usage:
 """
 import io
 import os
-import shutil
-import subprocess
 import sys
 import tempfile
-import urllib.request
 import wave
-import zipfile
 from pathlib import Path
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-VOSK_URL  = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
-VOSK_DIR  = Path("models/vosk/small")
+FLAN_MODEL = os.environ.get("FLAN_MODEL", "google/flan-t5-base")
+FLAN_DIR   = Path("models/flan-t5-base")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
 
-SILERO_URL     = "https://github.com/snakers4/silero-vad/raw/v4.0/files/silero_vad.onnx"
-SILERO_DIR  = Path("models/silero_vad")
-SILERO_ONNX = SILERO_DIR / "silero_vad.onnx"
-
+# Exact packages from requirements.txt
 REQUIRED_PACKAGES = {
-    "fastapi":        "fastapi",
-    "uvicorn":        "uvicorn",
-    "vosk":           "vosk",
-    "faster_whisper": "faster-whisper",
-    "torch":          "torch",
-    "numpy":          "numpy",
-    "onnxruntime":    "onnxruntime",
-    "requests":       "requests",
+    "fastapi":        "fastapi>=0.115.0",
+    "uvicorn":        "uvicorn[standard]>=0.32.0",
+    "multipart":      "python-multipart>=0.0.17",
+    "av":             "av>=13.1.0",
+    "faster_whisper": "faster-whisper>=1.1.0",
+    "torch":          "torch>=2.5.0",
+    "transformers":   "transformers>=4.46.0",
+    "sentencepiece":  "sentencepiece>=0.2.0",
+    "numpy":          "numpy>=1.26.0",
+    "onnxruntime":    "onnxruntime>=1.20.0",
 }
 
 LINE = "─" * 60
@@ -56,85 +52,89 @@ def warn(msg: str) -> None: print(f"  !  {msg}")
 def err(msg: str)  -> None: print(f"  ✗  {msg}")
 
 
-def progress(count: int, block: int, total: int) -> None:
-    if total > 0:
-        pct  = min(int(count * block * 100 / total), 100)
-        bar  = "█" * (pct // 2)
-        print(f"\r  [{bar:<50}] {pct}%", end="", flush=True)
-
-
 def check_python() -> None:
-    if sys.version_info < (3, 9):
-        err("Python 3.9+ is required.")
+    if sys.version_info < (3, 10):
+        err("Python 3.10+ is required.")
         sys.exit(1)
     ok(f"Python {sys.version_info.major}.{sys.version_info.minor}")
 
 
 # ── Step implementations ───────────────────────────────────────────────────────
 
-def check_ffmpeg() -> None:
-    try:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=10)
-        if r.returncode == 0:
-            ok("FFmpeg found")
-        else:
-            raise FileNotFoundError
-    except Exception:
-        err("FFmpeg not found")
-        print("     Install:  sudo apt install ffmpeg  /  brew install ffmpeg")
-        sys.exit(1)
-
 
 def check_packages() -> None:
     missing = []
-    for import_name, pkg_name in REQUIRED_PACKAGES.items():
+    for import_name, pkg_spec in REQUIRED_PACKAGES.items():
         try:
             __import__(import_name)
-            ok(pkg_name)
+            ok(pkg_spec)
         except ImportError:
-            err(pkg_name)
-            missing.append(pkg_name)
+            err(pkg_spec)
+            missing.append(pkg_spec)
     if missing:
-        print(f"\n  Run:  pip install -r requirements.txt")
+        print(f"\n  Missing packages. Install with:")
+        print(f"    pip install -r requirements.txt")
         sys.exit(1)
 
 
-def download_vosk() -> None:
-    if VOSK_DIR.exists():
-        ok(f"Already installed at {VOSK_DIR}")
-        return
-
-    print("  Downloading (~50 MB)…")
-    urllib.request.urlretrieve(VOSK_URL, "vosk.zip", progress)
-    print()
-
-    print("  Extracting…")
-    with zipfile.ZipFile("vosk.zip") as zf:
-        zf.extractall(".")
-
-    VOSK_DIR.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move("vosk-model-small-en-us-0.15", str(VOSK_DIR))
-    Path("vosk.zip").unlink(missing_ok=True)
-    ok(f"Installed at {VOSK_DIR}")
-
-
-def download_vad() -> None:
-    """Download Silero VAD ONNX — no NeMo or NVIDIA account needed."""
-    SILERO_DIR.mkdir(parents=True, exist_ok=True)
-
-    if SILERO_ONNX.exists():
-        ok(f"Already installed at {SILERO_ONNX}")
-        return
-
-    print("  Downloading Silero VAD ONNX (~2 MB)…")
+def download_whisper() -> None:
+    """Download faster-whisper model (auto-cached by CTranslate2)."""
     try:
-        urllib.request.urlretrieve(SILERO_URL, SILERO_ONNX, progress)
-        print()
-        size = SILERO_ONNX.stat().st_size / 1024 / 1024
-        ok(f"Installed at {SILERO_ONNX} ({size:.1f} MB)")
+        from faster_whisper import WhisperModel
+    except ImportError:
+        err("faster-whisper not installed")
+        sys.exit(1)
+
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+    model_name_safe = f"Systran--faster-whisper-{WHISPER_MODEL.replace('.', '-')}"
+    if any(model_name_safe in str(p) for p in cache_dir.glob("*")):
+        ok(f"faster-whisper ({WHISPER_MODEL}) already cached")
+        return
+
+    print(f"  Downloading faster-whisper {WHISPER_MODEL} (CPU-optimized)...")
+    print("  This may take a few minutes on first run.")
+    try:
+        _ = WhisperModel(
+            WHISPER_MODEL,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=4,
+        )
+        ok(f"faster-whisper ({WHISPER_MODEL} / int8 / CPU) ready")
     except Exception as exc:
-        print()
-        err(f"Download failed: {exc}")
+        err(f"Whisper download failed: {exc}")
+        sys.exit(1)
+
+
+def download_flan() -> None:
+    """Download Flan-T5 model using transformers (CPU-friendly)."""
+    try:
+        from transformers import T5ForConditionalGeneration, T5Tokenizer
+    except ImportError:
+        err("transformers not installed — cannot download Flan-T5")
+        sys.exit(1)
+
+    FLAN_DIR.mkdir(parents=True, exist_ok=True)
+
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+    model_name_safe = FLAN_MODEL.replace("/", "--")
+    if any(model_name_safe in str(p) for p in cache_dir.glob("*")):
+        ok(f"Flan-T5 already cached")
+        return
+
+    print(f"  Downloading {FLAN_MODEL} (CPU-optimized, ~1 GB)...")
+    print("  This may take a few minutes on first run.")
+    try:
+        tokenizer = T5Tokenizer.from_pretrained(FLAN_MODEL, cache_dir=str(FLAN_DIR))
+        model = T5ForConditionalGeneration.from_pretrained(
+            FLAN_MODEL,
+            torch_dtype="auto",
+            device_map="cpu",
+            cache_dir=str(FLAN_DIR),
+        )
+        ok(f"Flan-T5 ({FLAN_MODEL}) downloaded and ready")
+    except Exception as exc:
+        err(f"Flan-T5 download failed: {exc}")
         sys.exit(1)
 
 
@@ -143,8 +143,9 @@ def warmup_whisper() -> None:
         import numpy as np
         from faster_whisper import WhisperModel
 
-        model = WhisperModel("base.en", device="cpu", compute_type="int8")
+        model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=4)
 
+        # 1 second of silence as in-memory WAV
         silence = np.zeros(16_000, dtype=np.int16)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
@@ -153,45 +154,82 @@ def warmup_whisper() -> None:
             w.setframerate(16_000)
             w.writeframes(silence.tobytes())
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(buf.getvalue())
-            tmp = f.name
-
-        list(model.transcribe(tmp, beam_size=1)[0])
-        Path(tmp).unlink(missing_ok=True)
-        ok("faster-whisper (base.en / int8) ready")
+        # faster-whisper accepts bytes directly via numpy array
+        audio = silence.astype(np.float32) / 32768.0
+        list(model.transcribe(audio, beam_size=1)[0])
+        ok(f"faster-whisper ({WHISPER_MODEL} / int8 / CPU) warmed up")
     except Exception as exc:
         warn(f"Whisper warmup failed: {exc}")
+
+
+def warmup_flan() -> None:
+    """Warm up Flan-T5 with a tiny inference to trigger any lazy downloads."""
+    try:
+        from transformers import T5ForConditionalGeneration, T5Tokenizer
+        import torch
+
+        tokenizer = T5Tokenizer.from_pretrained(FLAN_MODEL, cache_dir=str(FLAN_DIR))
+        model = T5ForConditionalGeneration.from_pretrained(
+            FLAN_MODEL,
+            torch_dtype=torch.float32,
+            device_map="cpu",
+            cache_dir=str(FLAN_DIR),
+        )
+        model.eval()
+
+        inputs = tokenizer("test", return_tensors="pt")
+        with torch.no_grad():
+            _ = model.generate(**inputs, max_new_tokens=4)
+        ok(f"Flan-T5 ({FLAN_MODEL} / CPU / float32) warmed up")
+    except Exception as exc:
+        warn(f"Flan-T5 warmup failed: {exc}")
+
+
+def warmup_pyav() -> None:
+    """Verify PyAV is working correctly."""
+    try:
+        import av
+        # Just verify we can create a resampler
+        resampler = av.audio.resampler.AudioResampler(
+            format="s16", layout="mono", rate=16000
+        )
+        ok(f"PyAV {av.__version__} ready (FFmpeg bundled)")
+    except Exception as exc:
+        err(f"PyAV check failed: {exc}")
+        sys.exit(1)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    header("Vosper — Model Setup")
-    print("  Pipeline:  FFmpeg → Silero VAD → Vosk ∥ faster-whisper")
+    header("Auris — Model Setup (CPU-only, FFmpeg-free)")
+    print("  Pipeline:  PyAV → faster-whisper → Flan-T5 (critique-gated)")
+    print("  No system FFmpeg required — PyAV bundles its own codecs")
+    print("  No VAD — frontend noise gate handles pre-filtering")
 
     check_python()
 
     TOTAL = 5
-    step(1, TOTAL, "FFmpeg")
-    check_ffmpeg()
-
-    step(2, TOTAL, "Python packages")
+    step(1, TOTAL, "Python packages")
     check_packages()
 
-    step(3, TOTAL, "Vosk small-en model")
-    download_vosk()
+    step(2, TOTAL, "PyAV (bundled FFmpeg)")
+    warmup_pyav()
 
-    step(4, TOTAL, "Silero VAD ONNX")
-    download_vad()
+    step(3, TOTAL, f"faster-whisper model ({WHISPER_MODEL})")
+    download_whisper()
 
-    step(5, TOTAL, "faster-whisper warmup")
+    step(4, TOTAL, f"Flan-T5 model ({FLAN_MODEL})")
+    download_flan()
+
+    step(5, TOTAL, "Model warmups")
     warmup_whisper()
+    warmup_flan()
 
     print(f"\n{LINE}")
     print("  Setup complete!\n")
     print("  Start the server:")
-    print("    uvicorn backend.main:app --reload --port 8000")
+    print("    uvicorn app.main:app --reload --port 8000")
     print(LINE)
 
 

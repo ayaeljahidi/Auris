@@ -1,16 +1,20 @@
-fastapi>=0.110.0
-transformers>=4.40.0
-sentencepiece>=0.1.99
-accelerate>=0.29.0
-uvicorn[standard]>=0.29.0
-python-multipart>=0.0.9
-vosk>=0.3.45
-faster-whisper>=1.0.0
-torch>=2.0.0
-torchaudio>=2.0.0
-numpy>=1.24.0
-ffmpeg-python>=0.2.0
-onnxruntime>=1.15.0
-requests>=2.28.0
-librosa>=0.10.0
-soundfile>=0.12.0
+# Auris
+# ── Web framework ──────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.17          # for UploadFile
+
+# ── Audio processing (FFmpeg-free) ─────────────────────────────────────────────
+av>=13.1.0                        # PyAV — bundles FFmpeg, replaces system ffmpeg
+numpy>=1.26.0
+
+# ── Transcription ──────────────────────────────────────────────────────────────
+faster-whisper>=1.1.0             # Whisper with CTranslate2, int8 CPU support
+
+# ── Text correction (Flan-T5) ──────────────────────────────────────────────────
+transformers>=4.46.0
+torch>=2.5.0                      # CPU-only wheel installed via index-url below
+sentencepiece>=0.2.0              # T5 tokenizer requirement
+
+# ── ONNX (kept for any future ONNX models) ─────────────────────────────────────
+onnxruntime>=1.20.0              

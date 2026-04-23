@@ -1,4 +1,4 @@
-"""Auris — FastAPI application entry point"""
+"""Auris — FastAPI application entry point (CPU-optimized, VAD removed, FFmpeg-free)"""
 import asyncio
 import logging
 import time
@@ -10,13 +10,11 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .audio import extract_audio, read_wav, pcm_to_wav, audio_duration_seconds
-from .models import load_whisper, load_silero, load_flan, health_status
+from .models import load_whisper, load_flan, health_status
 from .transcribe import (
     transcribe_whisper,
     transcribe_whisper_with_correction,
-    correct_text,
 )
-from .vad import run_vad
 from . import config
 
 logging.basicConfig(
@@ -27,7 +25,7 @@ log = logging.getLogger("auris")
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Auris API", version="9.0", docs_url="/api/docs")
+app = FastAPI(title="Auris API", version="10.0", docs_url="/api/docs")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,10 +42,9 @@ app.add_middleware(
 async def on_startup() -> None:
     """Pre-load all models in background threads so the first request is fast."""
     loop = asyncio.get_event_loop()
-    log.info("Pre-loading models…")
+    log.info("Pre-loading models (CPU-optimized, VAD removed, FFmpeg-free)…")
     for loader, name in [
         (load_whisper, "faster-whisper"),
-        (load_silero,  "Silero VAD"),
         (load_flan,    "Flan-T5"),
     ]:
         try:
@@ -61,7 +58,7 @@ async def on_startup() -> None:
 
 @app.get("/health", tags=["system"])
 async def health() -> dict:
-    return {"status": "ok", "version": "9.0", **health_status()}
+    return {"status": "ok", "version": "10.0", **health_status()}
 
 
 # ── Transcribe (file upload) ───────────────────────────────────────────────────
@@ -69,21 +66,21 @@ async def health() -> dict:
 @app.post("/transcribe", tags=["transcription"])
 async def transcribe(file: UploadFile = File(...)):
     """
-    Full pipeline:  upload → FFmpeg → Silero VAD → Whisper + Flan-T5
+    Full pipeline:  upload → PyAV → Whisper + Flan-T5 (with critique)
 
-    Total latency = t(FFmpeg) + t(Silero VAD) + t(Whisper + Flan-T5)
+    VAD and FFmpeg subprocess removed. PyAV handles extraction in-memory.
+    Total latency = t(PyAV) + t(Whisper + Flan-T5)
     """
     t_start   = time.perf_counter()
     raw_bytes = await file.read()
     log.info("Received '%s'  (%d KB)", file.filename, len(raw_bytes) // 1024)
 
-    # Retrieve event loop once and reuse throughout the handler
     loop = asyncio.get_event_loop()
 
-    # 1 · FFmpeg ----------------------------------------------------------------
+    # 1 · PyAV extraction (in-memory, no temp files) ----------------------------
     t0 = time.perf_counter()
     try:
-        wav_bytes = extract_audio(raw_bytes)
+        wav_bytes = await loop.run_in_executor(None, extract_audio, raw_bytes)
     except Exception as exc:
         return JSONResponse(
             {"status": "error", "message": f"Audio extraction failed: {exc}"},
@@ -91,47 +88,39 @@ async def transcribe(file: UploadFile = File(...)):
         )
     pcm, sr  = read_wav(wav_bytes)
     duration = audio_duration_seconds(pcm, sr)
-    t_ffmpeg = _ms(t0)
+    t_extract = _ms(t0)
 
-    # 2 · Silero VAD -----------------------------------------------------------
+    # 2 · Whisper + Flan-T5 (batched segment correction) -------------------------
     t1 = time.perf_counter()
     try:
-        vad_segments, speech_wav = run_vad(wav_bytes, sr)
-    except Exception as exc:
-        log.error("VAD error: %s", exc)
-        vad_segments, speech_wav = [], wav_bytes
-    t_vad = _ms(t1)
-
-    # 3 · Whisper + Flan-T5 (segment-level streaming parallelism) --------------
-    t2 = time.perf_counter()
-    try:
         whisper_result, correction = await loop.run_in_executor(
-            None, transcribe_whisper_with_correction, speech_wav
+            None, transcribe_whisper_with_correction, wav_bytes
         )
     except Exception as exc:
         return JSONResponse(
             {"status": "error", "message": f"Transcription failed: {exc}"},
             status_code=500,
         )
-    t_whisper = _ms(t2)
+    t_whisper = _ms(t1)
 
     t_total = _ms(t_start)
 
     log.info(
-        "Done — ffmpeg:%dms  vad:%dms  whisper+flan:%dms  total:%dms",
-        t_ffmpeg, t_vad, t_whisper, t_total,
+        "Done — extract:%dms  whisper+flan:%dms  total:%dms  "
+        "critique(corrected:%d/kept:%d)",
+        t_extract, t_whisper, t_total,
+        correction.get("critique_stats", {}).get("corrected", 0),
+        correction.get("critique_stats", {}).get("kept", 0),
     )
 
     return {
         "status":       "ok",
         "filename":     file.filename,
         "duration_sec": round(duration, 2),
-        "vad_segments": vad_segments,
         "whisper":      whisper_result,
         "correction":   correction,
         "timing": {
-            "ffmpeg_ms":   t_ffmpeg,
-            "vad_ms":      t_vad,
+            "extract_ms":  t_extract,
             "whisper_ms":  t_whisper,
             "total_ms":    t_total,
         },
@@ -144,13 +133,15 @@ async def transcribe(file: UploadFile = File(...)):
 async def ws_live(ws: WebSocket) -> None:
     """
     Live recording endpoint with configurable idle timeout.
+    VAD removed — raw audio goes straight to Whisper.
+    Flan-T5 is SKIPPED by default on live (config.FLAN_ENABLED_LIVE=false).
 
     Protocol:
       client  →  raw 16-bit mono PCM chunks (16 kHz)
       client  →  b"__END__"           (signals end of recording)
       server  →  {"type":"partial",   "text": "Recording… speak now"}
       server  →  {"type":"status",    "msg": …}
-      server  →  {"type":"final",     "whisper": …, "vad_segments": […], "correction": …}
+      server  →  {"type":"final",     "whisper": …, "correction": …}
       server  →  {"type":"error",     "msg": …}
     """
     await ws.accept()
@@ -161,7 +152,6 @@ async def ws_live(ws: WebSocket) -> None:
 
     try:
         while True:
-            # Timeout guard — close zombie connections that never send __END__
             try:
                 data = await asyncio.wait_for(
                     ws.receive_bytes(),
@@ -179,46 +169,54 @@ async def ws_live(ws: WebSocket) -> None:
 
             # ── End-of-recording sentinel ──────────────────────────────────────
             if data == b"__END__":
-                await ws.send_json({"type": "status", "msg": "Running Silero VAD + Whisper…"})
+                await ws.send_json({"type": "status", "msg": "Running Whisper…"})
                 full_wav = pcm_to_wav(bytes(pcm_buffer), 16_000)
 
                 if len(pcm_buffer) > 3_200:   # > 0.1 s of audio
                     try:
-                        vad_segs, speech_wav = run_vad(full_wav, 16_000)
-                        whisper_r, correction = await loop.run_in_executor(
-                            None, transcribe_whisper_with_correction, speech_wav
-                        )
+                        if config.FLAN_ENABLED_LIVE:
+                            whisper_r, correction = await loop.run_in_executor(
+                                None, transcribe_whisper_with_correction, full_wav
+                            )
+                        else:
+                            whisper_r = await loop.run_in_executor(
+                                None, transcribe_whisper, full_wav
+                            )
+                            correction = {
+                                "corrected":  whisper_r["text"],
+                                "enabled":    False,
+                                "model":      None,
+                                "latency_ms": 0,
+                                "critique_stats": {"corrected": 0, "kept": 0, "total": 0},
+                            }
                     except Exception as exc:
                         log.error("Live final error: %s", exc)
                         whisper_r  = {"text": "", "word_count": 0, "segments": []}
-                        vad_segs   = []
                         correction = {
                             "corrected":  "",
                             "enabled":    False,
                             "model":      None,
                             "latency_ms": 0,
+                            "critique_stats": {"corrected": 0, "kept": 0, "total": 0},
                         }
                 else:
                     whisper_r  = {"text": "", "word_count": 0, "segments": []}
-                    vad_segs   = []
                     correction = {
                         "corrected":  "",
                         "enabled":    False,
                         "model":      None,
                         "latency_ms": 0,
+                        "critique_stats": {"corrected": 0, "kept": 0, "total": 0},
                     }
 
                 await ws.send_json({
                     "type":         "final",
                     "whisper":      whisper_r,
-                    "vad_segments": vad_segs,
                     "correction":   correction,
                 })
                 break
 
             # ── Streaming chunk received ───────────────────────────────────────
-            # Vosk real-time partials are removed; send a simple status nudge
-            # so the client knows audio is being received.
             pcm_buffer.extend(data)
             await ws.send_json({
                 "type": "partial",

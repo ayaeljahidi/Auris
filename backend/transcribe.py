@@ -1,9 +1,8 @@
-"""Auris — Transcription engine (faster-whisper + Flan-T5)"""
+"""Auris — Transcription engine (faster-whisper + Flan-T5 with batched critique)"""
 import io
 import logging
 import time
 import wave
-from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 
@@ -23,6 +22,31 @@ def _wav_bytes_to_float32(wav_bytes: bytes) -> np.ndarray:
     with wave.open(io.BytesIO(wav_bytes), "rb") as w:
         pcm = w.readframes(w.getnframes())
     return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+# ── Critique logic ────────────────────────────────────────────────────────────
+
+def _should_correct_segment(seg) -> bool:
+    """
+    Decide whether a Whisper segment needs Flan-T5 correction.
+    Uses Whisper's own confidence metrics as a "critique":
+      - no_speech_prob:  probability the segment is silence/noise
+      - avg_logprob:     average log-probability of tokens (higher = more confident)
+      - compression_ratio:  how compressed the text is vs audio (high = hallucination)
+
+    Returns True if the segment looks low-quality and needs correction.
+    """
+    no_speech_prob = getattr(seg, "no_speech_prob", 0.0)
+    avg_logprob = getattr(seg, "avg_logprob", 0.0)
+    compression_ratio = getattr(seg, "compression_ratio", 1.0)
+
+    if no_speech_prob > config.CRITIQUE_NO_SPEECH_THRESHOLD:
+        return False
+    if avg_logprob < config.CRITIQUE_AVG_LOGPROB_THRESHOLD:
+        return True
+    if compression_ratio > config.CRITIQUE_COMPRESSION_RATIO_MAX:
+        return True
+    return False
 
 
 # ── faster-whisper (in-memory) ─────────────────────────────────────────────────
@@ -63,36 +87,44 @@ def transcribe_whisper(wav_bytes: bytes) -> dict:
     }
 
 
-# ── Flan-T5 single-segment corrector (used inside the streaming pipeline) ──────
+# ── Batched Flan-T5 correction for ALL low-confidence segments ────────────────
 
-def _correct_segment(text: str) -> str:
+def _batch_correct_segments(texts: list[str]) -> list[str]:
     """
-    Run Flan-T5 batched correction on a single segment's text.
-    All sentences within the segment are batched into one generate() call.
-    Returns the corrected text string (or the original on failure).
+    Run Flan-T5 correction on multiple segment texts in a SINGLE batched
+    generate() call. This is the key optimization — one model forward pass
+    for all segments instead of N separate passes.
+
+    Each text is split into sentences, all sentences across all segments
+    are batched together into one tokenizer + generate() call.
     """
     import torch
 
-    if not text or not text.strip():
-        return text
+    if not texts:
+        return []
 
     model, tokenizer = load_flan()
     if model is None or tokenizer is None:
-        return text
+        return texts
 
-    device    = next(model.parameters()).device
-    sentences = [s.strip() for s in text.split(".") if s.strip()]
-    if not sentences:
-        return text
+    device = next(model.parameters()).device
 
-    prompts = [
-        f"Rewrite this with correct grammar and spelling: {s}"
-        for s in sentences
-    ]
+    # Collect all sentences from all segments with their (segment_idx, sentence_idx)
+    all_prompts = []
+    mapping = []  # (segment_idx, sentence_idx)
 
-    # Single batched tokenize + generate call
+    for seg_idx, text in enumerate(texts):
+        sentences = [s.strip() for s in text.split(".") if s.strip()]
+        for sent_idx, sentence in enumerate(sentences):
+            all_prompts.append(f"Rewrite this with correct grammar and spelling: {sentence}")
+            mapping.append((seg_idx, sent_idx))
+
+    if not all_prompts:
+        return texts
+
+    # Single batched tokenize + generate for ALL sentences
     inputs = tokenizer(
-        prompts,
+        all_prompts,
         return_tensors="pt",
         padding=True,
         truncation=True,
@@ -108,26 +140,43 @@ def _correct_segment(text: str) -> str:
             no_repeat_ngram_size=3,
         )
 
-    corrected_parts = [
+    corrected_sentences = [
         tokenizer.decode(out, skip_special_tokens=True).rstrip(".").strip()
         for out in outputs
     ]
-    return ". ".join(corrected_parts) + "."
+
+    # Reassemble: group sentences back into segments
+    segment_sentences = [[] for _ in texts]
+    for (seg_idx, sent_idx), corrected in zip(mapping, corrected_sentences):
+        # Ensure list is long enough
+        while len(segment_sentences[seg_idx]) <= sent_idx:
+            segment_sentences[seg_idx].append("")
+        segment_sentences[seg_idx][sent_idx] = corrected
+
+    results = []
+    for seg_idx, text in enumerate(texts):
+        if segment_sentences[seg_idx]:
+            results.append(". ".join(segment_sentences[seg_idx]) + ".")
+        else:
+            results.append(text)
+
+    return results
 
 
-# ── Whisper + Flan-T5 segment-level streaming parallelism ─────────────────────
+# ── Whisper + Flan-T5 with batched segment correction ─────────────────────────
 
 def transcribe_whisper_with_correction(wav_bytes: bytes) -> tuple[dict, dict]:
     """
-    Decode WAV with faster-whisper (in-memory) while streaming each yielded
-    segment immediately to Flan-T5 for correction in a background thread via
-    ThreadPoolExecutor.  Whisper continues decoding the next segment
-    concurrently.  Futures are collected in order and reassembled once done.
+    Decode WAV with faster-whisper (in-memory), collect all segments,
+    then run Flan-T5 correction in ONE batched call for all low-confidence
+    segments. No ThreadPoolExecutor — sequential is faster when both tasks
+    are CPU-bound on the same cores.
+
+    Critique logic gates whether Flan-T5 actually runs per segment.
+    High-quality segments are "kept" without correction to save CPU.
 
     Returns:
         (whisper_result, correction_result)
-        whisper_result    — {text, word_count, segments}
-        correction_result — {corrected, enabled, model, latency_ms}
     """
     if not config.FLAN_ENABLED:
         wr = transcribe_whisper(wav_bytes)
@@ -136,10 +185,11 @@ def transcribe_whisper_with_correction(wav_bytes: bytes) -> tuple[dict, dict]:
             "enabled":    False,
             "model":      None,
             "latency_ms": 0,
+            "critique_stats": {"corrected": 0, "kept": 0, "total": 0},
         }
 
     audio = _wav_bytes_to_float32(wav_bytes)
-    t0    = time.perf_counter()
+    t0 = time.perf_counter()
 
     seg_iter, _ = load_whisper().transcribe(
         audio,
@@ -150,32 +200,43 @@ def transcribe_whisper_with_correction(wav_bytes: bytes) -> tuple[dict, dict]:
         condition_on_previous_text=False,
     )
 
-    segments: list[dict]   = []
-    parts:    list[str]    = []
-    futures:  list[Future] = []
+    segments: list[dict] = []
+    parts: list[str] = []
+    seg_objs: list = []
+    needs_correction: list[bool] = []
 
-    # Each Whisper segment is submitted to Flan-T5 immediately as it is yielded,
-    # so correction runs in parallel with Whisper decoding the next segment.
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        for seg in seg_iter:
-            seg_text = seg.text.strip()
-            segments.append({
-                "start": round(seg.start, 2),
-                "end":   round(seg.end, 2),
-                "text":  seg_text,
-            })
-            parts.append(seg.text)
-            futures.append(executor.submit(_correct_segment, seg_text))
+    for seg in seg_iter:
+        seg_text = seg.text.strip()
+        segments.append({
+            "start": round(seg.start, 2),
+            "end":   round(seg.end, 2),
+            "text":  seg_text,
+        })
+        parts.append(seg.text)
+        seg_objs.append(seg)
+        needs_correction.append(_should_correct_segment(seg))
 
-        # All segments yielded — collect corrected results in original order
-        corrected_parts = [fut.result() for fut in futures]
+    text = " ".join(parts).strip()
 
-    text           = " ".join(parts).strip()
+    # Collect only segments that failed critique
+    to_correct_texts = [parts[i] for i, need in enumerate(needs_correction) if need]
+    to_correct_indices = [i for i, need in enumerate(needs_correction) if need]
+
+    corrected_parts = parts.copy()
+
+    if to_correct_texts:
+        batch_results = _batch_correct_segments(to_correct_texts)
+        for idx_in_batch, seg_idx in enumerate(to_correct_indices):
+            corrected_parts[seg_idx] = batch_results[idx_in_batch]
+
     corrected_text = " ".join(corrected_parts).strip()
-    latency_ms     = round((time.perf_counter() - t0) * 1000)
+    latency_ms = round((time.perf_counter() - t0) * 1000)
 
-    log.info("Whisper+Flan-T5 streaming — %d seg(s) | %dms",
-             len(segments), latency_ms)
+    corrected_count = sum(1 for p, o in zip(corrected_parts, parts) if p != o)
+    kept_count = len(parts) - corrected_count
+
+    log.info("Whisper+Flan-T5 batched — %d seg(s) | %d corrected | %d kept | %dms",
+             len(segments), corrected_count, kept_count, latency_ms)
 
     whisper_result = {
         "text":       text,
@@ -187,11 +248,16 @@ def transcribe_whisper_with_correction(wav_bytes: bytes) -> tuple[dict, dict]:
         "enabled":    True,
         "model":      config.FLAN_MODEL,
         "latency_ms": latency_ms,
+        "critique_stats": {
+            "corrected": corrected_count,
+            "kept": kept_count,
+            "total": len(segments),
+        },
     }
     return whisper_result, correction_result
 
 
-# ── Flan-T5 standalone batched correction (used by the WebSocket path) ────────
+# ── Flan-T5 standalone batched correction (used by external callers) ──────────
 
 def correct_text(text: str) -> dict:
     """
@@ -214,7 +280,7 @@ def correct_text(text: str) -> dict:
                 "model": None, "latency_ms": 0}
 
     import torch
-    device    = next(model.parameters()).device
+    device = next(model.parameters()).device
     sentences = [s.strip() for s in text.split(".") if s.strip()]
     if not sentences:
         return {"corrected": text, "enabled": True,
@@ -227,7 +293,6 @@ def correct_text(text: str) -> dict:
 
     t_start = time.perf_counter()
 
-    # Single batched tokenize + generate call for all sentences
     inputs = tokenizer(
         prompts,
         return_tensors="pt",
@@ -250,7 +315,7 @@ def correct_text(text: str) -> dict:
         for out in outputs
     ]
 
-    latency_ms     = round((time.perf_counter() - t_start) * 1000)
+    latency_ms = round((time.perf_counter() - t_start) * 1000)
     corrected_text = ". ".join(corrected_parts) + "."
 
     log.info("Flan-T5 correction done — %d sentences | %dms",

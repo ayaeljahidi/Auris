@@ -1,14 +1,10 @@
-"""Vosper — Audio utility functions"""
+"""Vosper — Audio utility functions (PyAV-based, no system FFmpeg needed)"""
 import io
 import logging
-import os
-import subprocess
-import tempfile
 import wave
 
 import numpy as np
-
-from . import config
+import av
 
 log = logging.getLogger("vosper.audio")
 
@@ -32,45 +28,59 @@ def pcm_to_wav(pcm: bytes, sample_rate: int = 16000) -> bytes:
     return buf.getvalue()
 
 
-# ── FFmpeg extraction ──────────────────────────────────────────────────────────
+# ── PyAV extraction (replaces FFmpeg subprocess) ───────────────────────────────
 
-def extract_audio(video_bytes: bytes) -> bytes:
+def extract_audio(video_bytes: bytes, target_sr: int = 16000) -> bytes:
     """
-    Extract a 16-kHz mono PCM WAV from any video/audio container via FFmpeg.
-    Returns the WAV bytes.  Raises RuntimeError on failure.
+    Extract 16-kHz mono PCM WAV from any video/audio container via PyAV.
+    No system FFmpeg required — PyAV bundles its own codecs.
+    Returns WAV bytes. Raises RuntimeError on failure.
     """
-    with tempfile.NamedTemporaryFile(suffix=".input", delete=False) as fin:
-        fin.write(video_bytes)
-        in_path = fin.name
-
-    out_path = in_path + ".wav"
     try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", in_path,
-                "-vn",
-                "-acodec", "pcm_s16le",
-                "-ar",     "16000",
-                "-ac",     "1",
-                "-threads", str(config.FFMPEG_THREADS),
-                out_path,
-            ],
-            capture_output=True,
-            timeout=config.FFMPEG_TIMEOUT,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace")[-600:]
-            raise RuntimeError(f"FFmpeg failed: {stderr}")
+        input_container = av.open(io.BytesIO(video_bytes), mode="r")
+    except Exception as exc:
+        raise RuntimeError(f"PyAV cannot open input: {exc}")
 
-        with open(out_path, "rb") as f:
-            return f.read()
+    # Find the first audio stream
+    audio_stream = None
+    for stream in input_container.streams:
+        if stream.type == "audio":
+            audio_stream = stream
+            break
 
+    if audio_stream is None:
+        raise RuntimeError("No audio stream found in input")
+
+    # Resampler: convert to 16 kHz mono s16
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16",
+        layout="mono",
+        rate=target_sr,
+    )
+
+    pcm_chunks = []
+
+    try:
+        for packet in input_container.demux(audio_stream):
+            for frame in packet.decode():
+                # Resample frame to target format
+                resampled_frames = resampler.resample(frame)
+                for resampled in resampled_frames:
+                    # to_ndarray() returns int16 for s16 format
+                    pcm_chunks.append(resampled.to_ndarray().tobytes())
+
+        # Flush resampler
+        flush_frames = resampler.resample(None)
+        for resampled in flush_frames:
+            pcm_chunks.append(resampled.to_ndarray().tobytes())
+
+    except Exception as exc:
+        raise RuntimeError(f"PyAV decode/resample failed: {exc}")
     finally:
-        for path in (in_path, out_path):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        input_container.close()
+
+    full_pcm = b"".join(pcm_chunks)
+    return pcm_to_wav(full_pcm, target_sr)
 
 
 def audio_duration_seconds(pcm: bytes, sample_rate: int) -> float:

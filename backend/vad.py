@@ -1,4 +1,4 @@
-"""Auris — Silero VAD (stateful ONNX)"""
+"""Auris — Silero VAD (stateful ONNX, CPU-optimized)"""
 import logging
 
 import numpy as np
