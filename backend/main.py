@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .audio import extract_audio, read_wav, pcm_to_wav, audio_duration_seconds
-from .models import load_whisper, load_flan, health_status
+from .models import load_whisper, load_flan, get_executor, health_status
 from .transcribe import (
     transcribe_whisper,
     transcribe_whisper_with_correction,
@@ -40,15 +40,15 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    """Pre-load all models in background threads so the first request is fast."""
-    loop = asyncio.get_event_loop()
+    """Pre-load all models and warm up the shared executor."""
+    executor = get_executor()   # creates the executor once at startup
     log.info("Pre-loading models (CPU-optimized, VAD removed, FFmpeg-free)…")
     for loader, name in [
         (load_whisper, "faster-whisper"),
         (load_flan,    "Flan-T5"),
     ]:
         try:
-            await loop.run_in_executor(None, loader)
+            await asyncio.get_event_loop().run_in_executor(executor, loader)
         except Exception as exc:
             log.warning("%s warmup skipped: %s", name, exc)
     log.info("✓ All models ready")
@@ -75,17 +75,19 @@ async def transcribe(file: UploadFile = File(...)):
     raw_bytes = await file.read()
     log.info("Received '%s'  (%d KB)", file.filename, len(raw_bytes) // 1024)
 
-    loop = asyncio.get_event_loop()
+    loop     = asyncio.get_event_loop()
+    executor = get_executor()
 
     # 1 · PyAV extraction (in-memory, no temp files) ----------------------------
     t0 = time.perf_counter()
     try:
-        wav_bytes = await loop.run_in_executor(None, extract_audio, raw_bytes)
+        wav_bytes = await loop.run_in_executor(executor, extract_audio, raw_bytes)
     except Exception as exc:
         return JSONResponse(
             {"status": "error", "message": f"Audio extraction failed: {exc}"},
             status_code=422,
         )
+    # Compute duration from WAV header without re-decoding PCM
     pcm, sr  = read_wav(wav_bytes)
     duration = audio_duration_seconds(pcm, sr)
     t_extract = _ms(t0)
@@ -94,7 +96,7 @@ async def transcribe(file: UploadFile = File(...)):
     t1 = time.perf_counter()
     try:
         whisper_result, correction = await loop.run_in_executor(
-            None, transcribe_whisper_with_correction, wav_bytes
+            executor, transcribe_whisper_with_correction, wav_bytes
         )
     except Exception as exc:
         return JSONResponse(
@@ -149,6 +151,7 @@ async def ws_live(ws: WebSocket) -> None:
 
     pcm_buffer = bytearray()
     loop       = asyncio.get_event_loop()
+    executor   = get_executor()
 
     try:
         while True:
@@ -176,11 +179,11 @@ async def ws_live(ws: WebSocket) -> None:
                     try:
                         if config.FLAN_ENABLED_LIVE:
                             whisper_r, correction = await loop.run_in_executor(
-                                None, transcribe_whisper_with_correction, full_wav
+                                executor, transcribe_whisper_with_correction, full_wav
                             )
                         else:
                             whisper_r = await loop.run_in_executor(
-                                None, transcribe_whisper, full_wav
+                                executor, transcribe_whisper, full_wav
                             )
                             correction = {
                                 "corrected":  whisper_r["text"],

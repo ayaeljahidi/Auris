@@ -92,11 +92,8 @@ def transcribe_whisper(wav_bytes: bytes) -> dict:
 def _batch_correct_segments(texts: list[str]) -> list[str]:
     """
     Run Flan-T5 correction on multiple segment texts in a SINGLE batched
-    generate() call. This is the key optimization — one model forward pass
-    for all segments instead of N separate passes.
-
-    Each text is split into sentences, all sentences across all segments
-    are batched together into one tokenizer + generate() call.
+    generate() call. Each text is split into sentences; all sentences across
+    all segments are batched together into one tokenizer + generate() call.
     """
     import torch
 
@@ -109,14 +106,20 @@ def _batch_correct_segments(texts: list[str]) -> list[str]:
 
     device = next(model.parameters()).device
 
-    # Collect all sentences from all segments with their (segment_idx, sentence_idx)
-    all_prompts = []
-    mapping = []  # (segment_idx, sentence_idx)
+    # Build flat prompt list and a parallel segment/sentence index map
+    all_prompts: list[str] = []
+    mapping: list[tuple[int, int]] = []   # (segment_idx, sentence_idx)
+    sentence_counts: list[int] = []       # how many sentences each segment has
 
     for seg_idx, text in enumerate(texts):
         sentences = [s.strip() for s in text.split(".") if s.strip()]
+        if not sentences:
+            sentences = [text.strip()]    # keep original if no period found
+        sentence_counts.append(len(sentences))
         for sent_idx, sentence in enumerate(sentences):
-            all_prompts.append(f"Rewrite this with correct grammar and spelling: {sentence}")
+            all_prompts.append(
+                f"Rewrite this with correct grammar and spelling: {sentence}"
+            )
             mapping.append((seg_idx, sent_idx))
 
     if not all_prompts:
@@ -145,22 +148,17 @@ def _batch_correct_segments(texts: list[str]) -> list[str]:
         for out in outputs
     ]
 
-    # Reassemble: group sentences back into segments
-    segment_sentences = [[] for _ in texts]
+    # Reassemble: pre-allocate lists to the exact sentence count per segment
+    segment_sentences: list[list[str]] = [
+        [""] * cnt for cnt in sentence_counts
+    ]
     for (seg_idx, sent_idx), corrected in zip(mapping, corrected_sentences):
-        # Ensure list is long enough
-        while len(segment_sentences[seg_idx]) <= sent_idx:
-            segment_sentences[seg_idx].append("")
         segment_sentences[seg_idx][sent_idx] = corrected
 
-    results = []
-    for seg_idx, text in enumerate(texts):
-        if segment_sentences[seg_idx]:
-            results.append(". ".join(segment_sentences[seg_idx]) + ".")
-        else:
-            results.append(text)
-
-    return results
+    return [
+        ". ".join(sents) + "." if sents else texts[i]
+        for i, sents in enumerate(segment_sentences)
+    ]
 
 
 # ── Whisper + Flan-T5 with batched segment correction ─────────────────────────
@@ -179,7 +177,27 @@ def transcribe_whisper_with_correction(wav_bytes: bytes) -> tuple[dict, dict]:
         (whisper_result, correction_result)
     """
     if not config.FLAN_ENABLED:
-        wr = transcribe_whisper(wav_bytes)
+        # Run Whisper once and wrap result — don't call transcribe_whisper()
+        # separately which would decode the WAV a second time.
+        audio = _wav_bytes_to_float32(wav_bytes)
+        seg_iter, _ = load_whisper().transcribe(
+            audio,
+            language=config.WHISPER_LANGUAGE,
+            beam_size=config.WHISPER_BEAM_SIZE,
+            word_timestamps=True,
+            vad_filter=False,
+            condition_on_previous_text=False,
+        )
+        segments: list[dict] = []
+        parts:    list[str]  = []
+        for seg in seg_iter:
+            segments.append({"start": round(seg.start, 2),
+                              "end":   round(seg.end,   2),
+                              "text":  seg.text.strip()})
+            parts.append(seg.text)
+        text = " ".join(parts).strip()
+        wr = {"text": text, "word_count": len(text.split()) if text else 0,
+              "segments": segments}
         return wr, {
             "corrected":  wr["text"],
             "enabled":    False,

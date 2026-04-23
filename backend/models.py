@@ -1,6 +1,7 @@
 """Auris — Model singletons (lazy-loaded, thread-safe, CPU-optimized, VAD removed)"""
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -19,6 +20,25 @@ _flan_tokenizer: T5Tokenizer | None                = None
 
 _whisper_lock = threading.Lock()
 _flan_lock    = threading.Lock()
+
+# ── Shared ThreadPoolExecutor (avoids per-request thread creation overhead) ───
+# Size = CPU threads used by Whisper + 1 for Flan; keeps OS thread count bounded.
+_executor: ThreadPoolExecutor | None = None
+_executor_lock = threading.Lock()
+
+
+def get_executor() -> ThreadPoolExecutor:
+    """Return the shared process-wide ThreadPoolExecutor, creating it once."""
+    global _executor
+    if _executor is not None:
+        return _executor
+    with _executor_lock:
+        if _executor is None:
+            workers = max(2, config.WHISPER_CPU_THREADS)
+            _executor = ThreadPoolExecutor(max_workers=workers,
+                                           thread_name_prefix="auris-worker")
+            log.info("✓ ThreadPoolExecutor created (max_workers=%d)", workers)
+    return _executor
 
 
 def load_whisper() -> WhisperModel:
@@ -80,4 +100,5 @@ def health_status() -> dict:
         "flan_enabled_live": config.FLAN_ENABLED_LIVE,
         "flan_model":       config.FLAN_MODEL if config.FLAN_ENABLED else None,
         "device":           "cpu",
+        "executor_workers": get_executor()._max_workers,
     }
