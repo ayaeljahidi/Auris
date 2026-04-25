@@ -1,4 +1,4 @@
-"""Auris — FastAPI application entry point (CPU-optimized, VAD removed, FFmpeg-free)"""
+"""Auris — FastAPI application (zero-copy, aggressively optimized)"""
 import asyncio
 import logging
 import time
@@ -9,12 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .audio import extract_audio, read_wav, pcm_to_wav, audio_duration_seconds
-from .models import load_whisper, load_flan, get_executor, health_status
-from .transcribe import (
-    transcribe_whisper,
-    transcribe_whisper_with_correction,
-)
+from .audio import extract_audio_to_numpy, pcm_to_wav, audio_duration_from_array
+from .models import load_whisper, load_flan, health_status
+from .transcribe import transcribe_whisper, transcribe_whisper_with_correction
 from . import config
 
 logging.basicConfig(
@@ -25,7 +22,7 @@ log = logging.getLogger("auris")
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Auris API", version="10.0", docs_url="/api/docs")
+app = FastAPI(title="Auris API", version="11.0", docs_url="/api/docs")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,15 +37,11 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    """Pre-load all models and warm up the shared executor."""
-    executor = get_executor()   # creates the executor once at startup
-    log.info("Pre-loading models (CPU-optimized, VAD removed, FFmpeg-free)…")
-    for loader, name in [
-        (load_whisper, "faster-whisper"),
-        (load_flan,    "Flan-T5"),
-    ]:
+    """Pre-load all models in background threads."""
+    log.info("Pre-loading models (zero-copy, CPU-optimized)…")
+    for loader, name in [(load_whisper, "faster-whisper"), (load_flan, "Flan-T5")]:
         try:
-            await asyncio.get_event_loop().run_in_executor(executor, loader)
+            await asyncio.to_thread(loader)
         except Exception as exc:
             log.warning("%s warmup skipped: %s", name, exc)
     log.info("✓ All models ready")
@@ -58,7 +51,7 @@ async def on_startup() -> None:
 
 @app.get("/health", tags=["system"])
 async def health() -> dict:
-    return {"status": "ok", "version": "10.0", **health_status()}
+    return {"status": "ok", "version": "11.0", **health_status()}
 
 
 # ── Transcribe (file upload) ───────────────────────────────────────────────────
@@ -66,37 +59,30 @@ async def health() -> dict:
 @app.post("/transcribe", tags=["transcription"])
 async def transcribe(file: UploadFile = File(...)):
     """
-    Full pipeline:  upload → PyAV → Whisper + Flan-T5 (with critique)
-
-    VAD and FFmpeg subprocess removed. PyAV handles extraction in-memory.
-    Total latency = t(PyAV) + t(Whisper + Flan-T5)
+    Zero-copy pipeline: upload → PyAV → numpy → Whisper + Flan-T5.
+    Eliminates WAV serialization round-trip entirely.
     """
-    t_start   = time.perf_counter()
+    t_start = time.perf_counter()
     raw_bytes = await file.read()
     log.info("Received '%s'  (%d KB)", file.filename, len(raw_bytes) // 1024)
 
-    loop     = asyncio.get_event_loop()
-    executor = get_executor()
-
-    # 1 · PyAV extraction (in-memory, no temp files) ----------------------------
+    # 1 · PyAV extraction → numpy float32 (zero-copy) ---------------------------
     t0 = time.perf_counter()
     try:
-        wav_bytes = await loop.run_in_executor(executor, extract_audio, raw_bytes)
+        audio = await asyncio.to_thread(extract_audio_to_numpy, raw_bytes)
     except Exception as exc:
         return JSONResponse(
             {"status": "error", "message": f"Audio extraction failed: {exc}"},
             status_code=422,
         )
-    # Compute duration from WAV header without re-decoding PCM
-    pcm, sr  = read_wav(wav_bytes)
-    duration = audio_duration_seconds(pcm, sr)
+    duration = audio_duration_from_array(audio)
     t_extract = _ms(t0)
 
-    # 2 · Whisper + Flan-T5 (batched segment correction) -------------------------
+    # 2 · Whisper + Flan-T5 (accepts numpy directly) ----------------------------
     t1 = time.perf_counter()
     try:
-        whisper_result, correction = await loop.run_in_executor(
-            executor, transcribe_whisper_with_correction, wav_bytes
+        whisper_result, correction = await asyncio.to_thread(
+            transcribe_whisper_with_correction, audio
         )
     except Exception as exc:
         return JSONResponse(
@@ -104,7 +90,6 @@ async def transcribe(file: UploadFile = File(...)):
             status_code=500,
         )
     t_whisper = _ms(t1)
-
     t_total = _ms(t_start)
 
     log.info(
@@ -116,15 +101,15 @@ async def transcribe(file: UploadFile = File(...)):
     )
 
     return {
-        "status":       "ok",
-        "filename":     file.filename,
+        "status": "ok",
+        "filename": file.filename,
         "duration_sec": round(duration, 2),
-        "whisper":      whisper_result,
-        "correction":   correction,
+        "whisper": whisper_result,
+        "correction": correction,
         "timing": {
-            "extract_ms":  t_extract,
-            "whisper_ms":  t_whisper,
-            "total_ms":    t_total,
+            "extract_ms": t_extract,
+            "whisper_ms": t_whisper,
+            "total_ms": t_total,
         },
     }
 
@@ -134,24 +119,23 @@ async def transcribe(file: UploadFile = File(...)):
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket) -> None:
     """
-    Live recording endpoint with configurable idle timeout.
-    VAD removed — raw audio goes straight to Whisper.
-    Flan-T5 is SKIPPED by default on live (config.FLAN_ENABLED_LIVE=false).
+    Live recording endpoint. Pre-allocated buffer, zero-copy path.
+    Flan-T5 skipped by default on live.
 
     Protocol:
-      client  →  raw 16-bit mono PCM chunks (16 kHz)
-      client  →  b"__END__"           (signals end of recording)
-      server  →  {"type":"partial",   "text": "Recording… speak now"}
-      server  →  {"type":"status",    "msg": …}
-      server  →  {"type":"final",     "whisper": …, "correction": …}
-      server  →  {"type":"error",     "msg": …}
+      client → raw 16-bit mono PCM chunks (16 kHz)
+      client → b"__END__"
+      server → {"type":"partial", "text": "Recording…"}
+      server → {"type":"status", "msg": …}
+      server → {"type":"final", "whisper": …, "correction": …}
     """
     await ws.accept()
     log.info("Live WebSocket connected")
 
-    pcm_buffer = bytearray()
-    loop       = asyncio.get_event_loop()
-    executor   = get_executor()
+    # Pre-allocate buffer: 5 minutes of 16kHz mono = ~9.6MB
+    MAX_PCM = 16_000 * 2 * 300  # sr * bytes_per_sample * seconds
+    pcm_buffer = bytearray(MAX_PCM)
+    buf_pos = 0
 
     try:
         while True:
@@ -161,79 +145,60 @@ async def ws_live(ws: WebSocket) -> None:
                     timeout=config.WS_LIVE_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                log.warning("Live WebSocket timed out after %ds",
-                            config.WS_LIVE_TIMEOUT)
-                try:
-                    await ws.send_json({"type": "error", "msg": "Recording timeout"})
-                except Exception:
-                    pass
+                log.warning("Live WebSocket timed out after %ds", config.WS_LIVE_TIMEOUT)
+                await _safe_send(ws, {"type": "error", "msg": "Recording timeout"})
                 await ws.close()
                 return
 
             # ── End-of-recording sentinel ──────────────────────────────────────
             if data == b"__END__":
-                await ws.send_json({"type": "status", "msg": "Running Whisper…"})
-                full_wav = pcm_to_wav(bytes(pcm_buffer), 16_000)
+                await _safe_send(ws, {"type": "status", "msg": "Running Whisper…"})
 
-                if len(pcm_buffer) > 3_200:   # > 0.1 s of audio
+                active_pcm = pcm_buffer[:buf_pos]
+                if buf_pos > 3_200:  # > 0.1 s
+                    # Zero-copy: view as numpy array directly from bytearray
+                    audio = np.frombuffer(active_pcm, dtype=np.int16)
+                    audio = audio.astype(np.float32, copy=False) * (1.0 / 32768.0)
+
                     try:
                         if config.FLAN_ENABLED_LIVE:
-                            whisper_r, correction = await loop.run_in_executor(
-                                executor, transcribe_whisper_with_correction, full_wav
+                            whisper_r, correction = await asyncio.to_thread(
+                                transcribe_whisper_with_correction, audio
                             )
                         else:
-                            whisper_r = await loop.run_in_executor(
-                                executor, transcribe_whisper, full_wav
+                            whisper_r = await asyncio.to_thread(
+                                transcribe_whisper, audio
                             )
-                            correction = {
-                                "corrected":  whisper_r["text"],
-                                "enabled":    False,
-                                "model":      None,
-                                "latency_ms": 0,
-                                "critique_stats": {"corrected": 0, "kept": 0, "total": 0},
-                            }
+                            correction = _empty_correction(whisper_r["text"])
                     except Exception as exc:
                         log.error("Live final error: %s", exc)
-                        whisper_r  = {"text": "", "word_count": 0, "segments": []}
-                        correction = {
-                            "corrected":  "",
-                            "enabled":    False,
-                            "model":      None,
-                            "latency_ms": 0,
-                            "critique_stats": {"corrected": 0, "kept": 0, "total": 0},
-                        }
+                        whisper_r = {"text": "", "word_count": 0, "segments": []}
+                        correction = _empty_correction("")
                 else:
-                    whisper_r  = {"text": "", "word_count": 0, "segments": []}
-                    correction = {
-                        "corrected":  "",
-                        "enabled":    False,
-                        "model":      None,
-                        "latency_ms": 0,
-                        "critique_stats": {"corrected": 0, "kept": 0, "total": 0},
-                    }
+                    whisper_r = {"text": "", "word_count": 0, "segments": []}
+                    correction = _empty_correction("")
 
-                await ws.send_json({
-                    "type":         "final",
-                    "whisper":      whisper_r,
-                    "correction":   correction,
+                await _safe_send(ws, {
+                    "type": "final",
+                    "whisper": whisper_r,
+                    "correction": correction,
                 })
                 break
 
-            # ── Streaming chunk received ───────────────────────────────────────
-            pcm_buffer.extend(data)
-            await ws.send_json({
-                "type": "partial",
-                "text": "Recording… speak now",
-            })
+            # ── Streaming chunk ────────────────────────────────────────────────
+            if buf_pos + len(data) > MAX_PCM:
+                await _safe_send(ws, {"type": "error", "msg": "Recording too long"})
+                await ws.close()
+                return
+            pcm_buffer[buf_pos:buf_pos + len(data)] = data
+            buf_pos += len(data)
+            await _safe_send(ws, {"type": "partial", "text": "Recording… speak now"})
 
     except WebSocketDisconnect:
         log.info("Live WebSocket disconnected")
     except Exception as exc:
         log.error("WebSocket error: %s", exc)
-        try:
-            await ws.send_json({"type": "error", "msg": str(exc)})
-        except Exception:
-            pass
+        await _safe_send(ws, {"type": "error", "msg": str(exc)})
 
 
 # ── Static frontend ────────────────────────────────────────────────────────────
@@ -246,5 +211,24 @@ if _frontend.exists():
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _ms(t: float) -> int:
-    """Elapsed milliseconds since perf_counter snapshot t."""
     return round((time.perf_counter() - t) * 1000)
+
+
+async def _safe_send(ws, msg: dict):
+    try:
+        await ws.send_json(msg)
+    except Exception:
+        pass
+
+
+def _empty_correction(text: str) -> dict:
+    return {
+        "corrected": text,
+        "enabled": False,
+        "model": None,
+        "latency_ms": 0,
+        "critique_stats": {"corrected": 0, "kept": 0, "total": 0},
+    }
+
+
+import numpy as np

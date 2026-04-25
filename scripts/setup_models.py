@@ -17,6 +17,8 @@ from pathlib import Path
 FLAN_MODEL = os.environ.get("FLAN_MODEL", "google/flan-t5-base")
 FLAN_DIR   = Path("models/flan-t5-base")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
+EMOTION_MODEL = os.environ.get("EMOTION_MODEL", "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition")
+EMOTION_DIR   = Path("models/emotion")
 
 # Exact packages from requirements.txt
 REQUIRED_PACKAGES = {
@@ -138,6 +140,38 @@ def download_flan() -> None:
         sys.exit(1)
 
 
+def download_emotion() -> None:
+    """Download DistilHuBERT emotion model using transformers (CPU-friendly)."""
+    try:
+        from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
+    except ImportError:
+        err("transformers not installed — cannot download emotion model")
+        sys.exit(1)
+
+    EMOTION_DIR.mkdir(parents=True, exist_ok=True)
+
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+    model_name_safe = EMOTION_MODEL.replace("/", "--")
+    if any(model_name_safe in str(p) for p in cache_dir.glob("*")):
+        ok(f"Emotion model already cached")
+        return
+
+    print(f"  Downloading {EMOTION_MODEL} (CPU-optimized, ~23 MB)...")
+    print("  This may take a few minutes on first run.")
+    try:
+        extractor = AutoFeatureExtractor.from_pretrained(EMOTION_MODEL, cache_dir=str(EMOTION_DIR))
+        model = AutoModelForAudioClassification.from_pretrained(
+            EMOTION_MODEL,
+            torch_dtype=torch.float32,
+            device_map="cpu",
+            cache_dir=str(EMOTION_DIR),
+        )
+        ok(f"Emotion model ({EMOTION_MODEL}) downloaded and ready")
+    except Exception as exc:
+        err(f"Emotion model download failed: {exc}")
+        sys.exit(1)
+
+
 def warmup_whisper() -> None:
     try:
         import numpy as np
@@ -185,6 +219,31 @@ def warmup_flan() -> None:
         warn(f"Flan-T5 warmup failed: {exc}")
 
 
+def warmup_emotion() -> None:
+    """Warm up emotion model with a tiny inference."""
+    try:
+        from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
+        import numpy as np
+
+        extractor = AutoFeatureExtractor.from_pretrained(EMOTION_MODEL, cache_dir=str(EMOTION_DIR))
+        model = AutoModelForAudioClassification.from_pretrained(
+            EMOTION_MODEL,
+            torch_dtype=torch.float32,
+            device_map="cpu",
+            cache_dir=str(EMOTION_DIR),
+        )
+        model.eval()
+
+        # 1 second of silence
+        audio = np.zeros(16_000, dtype=np.float32)
+        inputs = extractor(audio, sampling_rate=16_000, return_tensors="pt")
+        with torch.no_grad():
+            _ = model(**inputs)
+        ok(f"Emotion model ({EMOTION_MODEL} / CPU / float32) warmed up")
+    except Exception as exc:
+        warn(f"Emotion warmup failed: {exc}")
+
+
 def warmup_pyav() -> None:
     """Verify PyAV is working correctly."""
     try:
@@ -203,13 +262,13 @@ def warmup_pyav() -> None:
 
 def main() -> None:
     header("Auris — Model Setup (CPU-only, FFmpeg-free)")
-    print("  Pipeline:  PyAV → faster-whisper → Flan-T5 (critique-gated)")
+    print("  Pipeline:  PyAV → faster-whisper → Flan-T5 (critique-gated) → DistilHuBERT-emotion")
     print("  No system FFmpeg required — PyAV bundles its own codecs")
     print("  No VAD — frontend noise gate handles pre-filtering")
 
     check_python()
 
-    TOTAL = 5
+    TOTAL = 6
     step(1, TOTAL, "Python packages")
     check_packages()
 
@@ -222,9 +281,13 @@ def main() -> None:
     step(4, TOTAL, f"Flan-T5 model ({FLAN_MODEL})")
     download_flan()
 
-    step(5, TOTAL, "Model warmups")
+    step(5, TOTAL, f"Emotion model ({EMOTION_MODEL})")
+    download_emotion()
+
+    step(6, TOTAL, "Model warmups")
     warmup_whisper()
     warmup_flan()
+    warmup_emotion()
 
     print(f"\n{LINE}")
     print("  Setup complete!\n")

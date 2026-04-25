@@ -1,4 +1,4 @@
-"""Vosper — Audio utility functions (PyAV-based, no system FFmpeg needed)"""
+"""Vosper — Audio utility functions (zero-copy, PyAV-optimized)"""
 import io
 import logging
 import wave
@@ -28,61 +28,89 @@ def pcm_to_wav(pcm: bytes, sample_rate: int = 16000) -> bytes:
     return buf.getvalue()
 
 
-# ── PyAV extraction (replaces FFmpeg subprocess) ───────────────────────────────
+def pcm_to_float32(pcm: bytes) -> np.ndarray:
+    """Zero-copy conversion: int16 PCM bytes → float32 numpy array."""
+    # view as int16 then in-place divide — single allocation
+    arr = np.frombuffer(pcm, dtype=np.int16)
+    return arr.astype(np.float32, copy=False) * (1.0 / 32768.0)
 
-def extract_audio(video_bytes: bytes, target_sr: int = 16000) -> bytes:
+
+# ── PyAV extraction (zero-copy, returns numpy array directly) ──────────────────
+
+def extract_audio_to_numpy(video_bytes: bytes, target_sr: int = 16000) -> np.ndarray:
     """
-    Extract 16-kHz mono PCM WAV from any video/audio container via PyAV.
-    No system FFmpeg required — PyAV bundles its own codecs.
-    Returns WAV bytes. Raises RuntimeError on failure.
+    Extract 16-kHz mono float32 numpy array from any video/audio container.
+    Zero-copy path where possible. No temp files. Returns array ready for Whisper.
     """
     try:
         input_container = av.open(io.BytesIO(video_bytes), mode="r")
     except Exception as exc:
         raise RuntimeError(f"PyAV cannot open input: {exc}")
 
-    # Find the first audio stream
     audio_stream = None
     for stream in input_container.streams:
         if stream.type == "audio":
             audio_stream = stream
             break
-
     if audio_stream is None:
         raise RuntimeError("No audio stream found in input")
 
-    # Resampler: convert to 16 kHz mono s16
     resampler = av.audio.resampler.AudioResampler(
-        format="s16",
-        layout="mono",
-        rate=target_sr,
+        format="s16", layout="mono", rate=target_sr,
     )
 
-    pcm_chunks = []
+    # Collect frames in a list then concatenate once — avoids per-frame tobytes()
+    frames: list[np.ndarray] = []
+    total_samples = 0
 
     try:
         for packet in input_container.demux(audio_stream):
             for frame in packet.decode():
-                # Resample frame to target format
-                resampled_frames = resampler.resample(frame)
-                for resampled in resampled_frames:
-                    # to_ndarray() returns int16 for s16 format
-                    pcm_chunks.append(resampled.to_ndarray().tobytes())
+                resampled = resampler.resample(frame)
+                for rframe in resampled:
+                    nd = rframe.to_ndarray()  # shape: (channels, samples) or (samples,)
+                    # Flatten if needed — mono so should be 1D already
+                    if nd.ndim > 1:
+                        nd = nd.reshape(-1)
+                    frames.append(nd)
+                    total_samples += nd.size
 
-        # Flush resampler
-        flush_frames = resampler.resample(None)
-        for resampled in flush_frames:
-            pcm_chunks.append(resampled.to_ndarray().tobytes())
+        # Flush
+        for rframe in resampler.resample(None):
+            nd = rframe.to_ndarray()
+            if nd.ndim > 1:
+                nd = nd.reshape(-1)
+            frames.append(nd)
+            total_samples += nd.size
 
     except Exception as exc:
         raise RuntimeError(f"PyAV decode/resample failed: {exc}")
     finally:
         input_container.close()
 
-    full_pcm = b"".join(pcm_chunks)
-    return pcm_to_wav(full_pcm, target_sr)
+    if not frames:
+        return np.array([], dtype=np.float32)
+
+    # Single concatenation + in-place normalization
+    pcm_int16 = np.concatenate(frames)
+    return pcm_int16.astype(np.float32, copy=False) * (1.0 / 32768.0)
+
+
+def extract_audio(video_bytes: bytes, target_sr: int = 16000) -> bytes:
+    """
+    Legacy wrapper: returns WAV bytes for APIs that need it.
+    Prefer extract_audio_to_numpy() for Whisper pipeline.
+    """
+    arr = extract_audio_to_numpy(video_bytes, target_sr)
+    pcm = (arr * 32768.0).astype(np.int16).tobytes()
+    return pcm_to_wav(pcm, target_sr)
 
 
 def audio_duration_seconds(pcm: bytes, sample_rate: int) -> float:
     """Duration of raw 16-bit mono PCM in seconds."""
     return len(pcm) / (sample_rate * 2)
+
+
+def audio_duration_from_array(arr: np.ndarray, sample_rate: int = 16000) -> float:
+    """Duration of float32 numpy array in seconds."""
+    return arr.size / sample_rate

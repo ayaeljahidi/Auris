@@ -1,7 +1,7 @@
-"""Auris — Model singletons (lazy-loaded, thread-safe, CPU-optimized, VAD removed)"""
+"""Auris — Model singletons (lazy-loaded, thread-safe, CPU-optimized)"""
+import asyncio
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -21,25 +21,6 @@ _flan_tokenizer: T5Tokenizer | None                = None
 _whisper_lock = threading.Lock()
 _flan_lock    = threading.Lock()
 
-# ── Shared ThreadPoolExecutor (avoids per-request thread creation overhead) ───
-# Size = CPU threads used by Whisper + 1 for Flan; keeps OS thread count bounded.
-_executor: ThreadPoolExecutor | None = None
-_executor_lock = threading.Lock()
-
-
-def get_executor() -> ThreadPoolExecutor:
-    """Return the shared process-wide ThreadPoolExecutor, creating it once."""
-    global _executor
-    if _executor is not None:
-        return _executor
-    with _executor_lock:
-        if _executor is None:
-            workers = max(2, config.WHISPER_CPU_THREADS)
-            _executor = ThreadPoolExecutor(max_workers=workers,
-                                           thread_name_prefix="auris-worker")
-            log.info("✓ ThreadPoolExecutor created (max_workers=%d)", workers)
-    return _executor
-
 
 def load_whisper() -> WhisperModel:
     """Load faster-whisper optimized for CPU-only inference."""
@@ -49,7 +30,7 @@ def load_whisper() -> WhisperModel:
     with _whisper_lock:
         if _whisper_model is None:
             device  = "cpu"
-            compute = "int8"  # int8 is fastest on CPU
+            compute = "int8"
             _whisper_model = WhisperModel(
                 config.WHISPER_MODEL,
                 device=device,
@@ -63,12 +44,7 @@ def load_whisper() -> WhisperModel:
 
 
 def load_flan() -> tuple["T5ForConditionalGeneration", "T5Tokenizer"] | tuple[None, None]:
-    """
-    Lazy-load Flan-T5 for the transcription correction layer.
-    Returns (None, None) if FLAN_ENABLED=false in config.
-    Thread-safe via double-checked locking.
-    CPU-only, float32 for stability.
-    """
+    """Lazy-load Flan-T5. Returns (None, None) if FLAN_ENABLED=false."""
     global _flan_model, _flan_tokenizer
     if not config.FLAN_ENABLED:
         return None, None
@@ -84,7 +60,7 @@ def load_flan() -> tuple["T5ForConditionalGeneration", "T5Tokenizer"] | tuple[No
             )
             _flan_model = T5ForConditionalGeneration.from_pretrained(
                 config.FLAN_MODEL,
-                torch_dtype=torch.float32,  # float32 on CPU for stability
+                torch_dtype=torch.float32,
                 device_map="cpu",
                 cache_dir=config.FLAN_CACHE_DIR,
             )
@@ -100,5 +76,4 @@ def health_status() -> dict:
         "flan_enabled_live": config.FLAN_ENABLED_LIVE,
         "flan_model":       config.FLAN_MODEL if config.FLAN_ENABLED else None,
         "device":           "cpu",
-        "executor_workers": get_executor()._max_workers,
     }

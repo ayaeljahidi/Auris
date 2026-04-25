@@ -99,29 +99,6 @@ fastapi
 uvicorn
 numpy
 ```
-
-Install:
-
-```bash
-pip install faster-whisper transformers torch av fastapi uvicorn numpy
-```
-
----
-
-## Running
-
-```bash
-uvicorn auris.main:app --host 0.0.0.0 --port 8000
-```
-
-The server pre-loads both models on startup so the first request is fast.
-
----
-
-## Configuration
-
-All settings are controlled via environment variables. None are required — defaults work out of the box on a CPU machine.
-
 ### Model settings
 
 | Variable | Default | Description |
@@ -158,115 +135,10 @@ Segments that pass all three checks are kept without correction, saving CPU.
 | `CRITIQUE_AVG_LOGPROB_THRESHOLD` | `-0.5` | Correct if `avg_logprob` falls below this |
 | `CRITIQUE_COMPRESSION_RATIO_MAX` | `2.4` | Correct if `compression_ratio` exceeds this (hallucination signal) |
 
-### WebSocket
-
-| Variable | Default | Description |
-|---|---|---|
-| `WS_LIVE_TIMEOUT` | `300` | Seconds of idle silence before the WebSocket closes |
-
----
-
-## API
-
-### `GET /health`
-
-Returns model load status and configuration.
-
-```json
-{
-  "status": "ok",
-  "version": "10.0",
-  "whisper_model": "base.en",
-  "flan_enabled": true,
-  "flan_enabled_live": false,
-  "flan_model": "google/flan-t5-base",
-  "device": "cpu",
-  "executor_workers": 4
-}
-```
-
-### `POST /transcribe`
-
-Upload any audio or video file. Returns the Whisper transcript and the Flan-T5 corrected version with per-segment timing.
-
-**Request:** `multipart/form-data` with a `file` field.
-
-```bash
-curl -X POST http://localhost:8000/transcribe \
-  -F "file=@recording.mp4"
-```
-
-**Response:**
-
-```json
-{
-  "status": "ok",
-  "filename": "recording.mp4",
-  "duration_sec": 42.5,
-  "whisper": {
-    "text": "...",
-    "word_count": 120,
-    "segments": [
-      { "start": 0.0, "end": 3.2, "text": "Hello world" }
-    ]
-  },
-  "correction": {
-    "corrected": "...",
-    "enabled": true,
-    "model": "google/flan-t5-base",
-    "latency_ms": 310,
-    "critique_stats": {
-      "corrected": 3,
-      "kept": 12,
-      "total": 15
-    }
-  },
-  "timing": {
-    "extract_ms": 45,
-    "whisper_ms": 1820,
-    "total_ms": 1865
-  }
-}
-```
-
-### `WebSocket /ws/live`
-
-Stream raw 16-bit mono 16 kHz PCM chunks. Send `b"__END__"` when done recording.
-
-**Client → server:**
-- Binary frames of raw PCM (any chunk size)
-- `b"__END__"` to signal end of recording
-
-**Server → client:**
-```json
-{ "type": "partial", "text": "Recording… speak now" }
-{ "type": "status",  "msg": "Running Whisper…" }
-{ "type": "final",   "whisper": { ... }, "correction": { ... } }
-{ "type": "error",   "msg": "Recording timeout" }
-```
-
----
-
-## Performance notes
-
-**Choosing a Whisper model size on CPU:**
-
-| Model | ~VRAM | Relative speed | Use case |
-|---|---|---|---|
-| `tiny.en` | 75 MB | fastest | Real-time, short clips |
-| `base.en` | 145 MB | fast | Default — good balance |
-| `small.en` | 465 MB | medium | Better accuracy |
-| `medium.en` | 1.5 GB | slow | Highest accuracy |
-
-**Disabling Flan-T5** with `FLAN_ENABLED=false` cuts transcription latency roughly in half on CPU. Whisper `base.en` accuracy is already good for clear speech.
-
-**Critique thresholds** control how aggressively Flan-T5 is applied. Lowering `CRITIQUE_AVG_LOGPROB_THRESHOLD` (e.g. to `-0.8`) means fewer segments get corrected and the response is faster. Raising `CRITIQUE_COMPRESSION_RATIO_MAX` (e.g. to `3.0`) reduces hallucination correction.
-
----
-
-## Frontend
-
-If a `frontend/` directory exists at the project root, it is served as a static site on `/`. The API lives on `/transcribe`, `/ws/live`, and `/health`.
 
 
+Whisper transcribes the audio and returns segments. Each segment includes confidence metrics: no_speech_prob, avg_logprob, and compression_ratio.
+The critique filter checks those metrics on each segment. If a segment looks confident enough, it gets passed through untouched ("kept"). If it looks low-quality — low log probability, high compression ratio — it gets flagged for correction.
+Flan-T5 corrects only the flagged segments. All of them are batched into a single generate() call (not one call per segment), so the model overhead is paid once regardless of how many segments need fixing.
+The corrected segments replace the originals, and the full text is reassembled and returned alongside the raw Whisper output.
 
