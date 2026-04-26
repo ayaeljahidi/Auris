@@ -1,4 +1,4 @@
-"""Auris — Transcription engine (zero-copy, fused ops, batched critique)"""
+"""Auris -- Transcription engine (zero-copy, fused ops, batched critique)"""
 import io
 import logging
 import time
@@ -6,24 +6,23 @@ import wave
 
 import numpy as np
 
-from .models import load_whisper, load_flan
+from .models import load_whisper, load_flan, load_qgen
 from . import config
 
 log = logging.getLogger("auris.transcribe")
 
 
-# ── Zero-copy: WAV bytes → float32 numpy (single pass) ────────────────────────
+# -- Zero-copy: WAV bytes -> float32 numpy (single pass) ----------------------
 
 def _wav_bytes_to_float32(wav_bytes: bytes) -> np.ndarray:
     """Parse WAV header and return float32 array in one pass."""
     with wave.open(io.BytesIO(wav_bytes), "rb") as w:
         pcm = w.readframes(w.getnframes())
-    # Single allocation: view as int16, cast to float32, scale in-place
     arr = np.frombuffer(pcm, dtype=np.int16)
     return arr.astype(np.float32, copy=False) * (1.0 / 32768.0)
 
 
-# ── Critique logic (unchanged semantics, inlined for speed) ───────────────────
+# -- Critique logic ------------------------------------------------------------
 
 def _should_correct_segment(seg) -> bool:
     """Return True if segment quality is low enough to need Flan-T5."""
@@ -36,7 +35,7 @@ def _should_correct_segment(seg) -> bool:
     return False
 
 
-# ── faster-whisper (accepts numpy array directly) ─────────────────────────────
+# -- faster-whisper (accepts numpy array directly) ----------------------------
 
 def transcribe_whisper(audio: np.ndarray) -> dict:
     """
@@ -54,7 +53,7 @@ def transcribe_whisper(audio: np.ndarray) -> dict:
         condition_on_previous_text=False,
     )
     segments: list[dict] = []
-    parts: list[str] = []
+    parts:    list[str]  = []
 
     for seg in seg_iter:
         txt = seg.text.strip()
@@ -63,17 +62,17 @@ def transcribe_whisper(audio: np.ndarray) -> dict:
 
     text = " ".join(parts).strip()
     return {
-        "text": text,
+        "text":       text,
         "word_count": len(text.split()) if text else 0,
-        "segments": segments,
+        "segments":   segments,
     }
 
 
-# ── Fast Flan-T5: segment-level correction without sentence splitting ──────────
+# -- Fast Flan-T5: segment-level correction -----------------------------------
 
 def _batch_correct_segments(texts: list[str]) -> list[str]:
     """
-    Run Flan-T5 on segment texts directly (no sentence splitting).
+    Run Flan-T5 on segment texts directly.
     Single batched tokenizer + generate() call.
     """
     import torch
@@ -85,9 +84,7 @@ def _batch_correct_segments(texts: list[str]) -> list[str]:
     if model is None or tokenizer is None:
         return texts
 
-    device = next(model.parameters()).device
-
-    # Direct segment-level prompts — skip expensive sentence splitting
+    device  = next(model.parameters()).device
     prompts = [f"Fix grammar: {t}" for t in texts]
 
     inputs = tokenizer(
@@ -95,7 +92,7 @@ def _batch_correct_segments(texts: list[str]) -> list[str]:
         return_tensors="pt",
         padding=True,
         truncation=True,
-        max_length=256,  # Reduced from 512 — segments are shorter
+        max_length=256,
     ).to(device)
 
     with torch.no_grad():
@@ -104,7 +101,7 @@ def _batch_correct_segments(texts: list[str]) -> list[str]:
             max_new_tokens=config.FLAN_MAX_TOKENS,
             num_beams=config.FLAN_NUM_BEAMS,
             early_stopping=True,
-            no_repeat_ngram_size=2,  # Reduced from 3 — faster decoding
+            no_repeat_ngram_size=2,
         )
 
     return [
@@ -113,12 +110,87 @@ def _batch_correct_segments(texts: list[str]) -> list[str]:
     ]
 
 
-# ── Whisper + Flan-T5 with batched segment correction ─────────────────────────
+# -- Question generation with dedicated T5-QG model ---------------------------
+
+def _build_qg_prompt(text: str) -> str:
+    return f"generate question: {text}"
+
+
+def generate_questions(text: str) -> list[str]:
+    """
+    Generate comprehension questions using dedicated T5-QG model.
+    Runs at end of processing, logs to terminal only.
+    """
+    import torch
+
+    if not config.QGEN_ENABLED or not text or not text.strip():
+        return []
+
+    model, tokenizer = load_qgen()
+    if model is None or tokenizer is None:
+        return []
+
+    device      = next(model.parameters()).device
+    base_prompt = _build_qg_prompt(text)
+    prompts     = [base_prompt] * config.QGEN_NUM_QUESTIONS
+
+    inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512,
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=config.QGEN_MAX_TOKENS,
+            num_beams=config.QGEN_NUM_BEAMS,
+            early_stopping=True,
+            no_repeat_ngram_size=2,
+            do_sample=True,
+            top_p=0.92,
+            temperature=0.8,
+        )
+
+    questions = []
+    seen      = set()
+    for out in outputs:
+        q = tokenizer.decode(out, skip_special_tokens=True).strip()
+        q = q.replace("generate question:", "").strip()
+        q = q.replace("question:", "").strip()
+        if q and q not in seen and len(q) > 10:
+            seen.add(q)
+            questions.append(q)
+
+    return questions
+
+
+def _log_questions_terminal(text: str, source: str = "upload") -> None:
+    """Generate and log questions to terminal only. Not exposed in API response."""
+    t_start   = time.perf_counter()
+    questions = generate_questions(text)
+    q_latency = round((time.perf_counter() - t_start) * 1000)
+
+    if questions:
+        log.info("=" * 60)
+        log.info("QUESTIONS GENERATED (%s) -- %dms", source, q_latency)
+        log.info("-" * 60)
+        for i, q in enumerate(questions, 1):
+            log.info("  Q%d: %s", i, q)
+        log.info("=" * 60)
+    else:
+        log.info("No questions generated (%s) -- %dms", source, q_latency)
+
+
+# -- Whisper + Flan-T5 with batched segment correction ------------------------
 
 def transcribe_whisper_with_correction(audio: np.ndarray) -> tuple[dict, dict]:
     """
     Decode with Whisper, then run Flan-T5 in ONE batched call for low-confidence
-    segments. Accepts numpy array directly — zero copy from extraction.
+    segments. Accepts numpy array directly -- zero copy from extraction.
+    Question generation runs at the end with dedicated T5-QG, terminal-only.
 
     Returns:
         (whisper_result, correction_result)
@@ -134,8 +206,8 @@ def transcribe_whisper_with_correction(audio: np.ndarray) -> tuple[dict, dict]:
         condition_on_previous_text=False,
     )
 
-    segments: list[dict] = []
-    parts: list[str] = []
+    segments:         list[dict] = []
+    parts:            list[str]  = []
     needs_correction: list[bool] = []
 
     for seg in seg_iter:
@@ -146,71 +218,77 @@ def transcribe_whisper_with_correction(audio: np.ndarray) -> tuple[dict, dict]:
 
     text = " ".join(parts).strip()
 
-    # Early exit: no correction needed at all
+    # Early exit: no correction needed
     if not config.FLAN_ENABLED or not any(needs_correction):
         latency_ms = round((time.perf_counter() - t0) * 1000)
         wr = {"text": text, "word_count": len(text.split()) if text else 0, "segments": segments}
+
+        _log_questions_terminal(text, source="upload")
+
         return wr, {
-            "corrected": wr["text"],
-            "enabled": config.FLAN_ENABLED,
-            "model": config.FLAN_MODEL if config.FLAN_ENABLED else None,
-            "latency_ms": latency_ms,
+            "corrected":     wr["text"],
+            "enabled":       config.FLAN_ENABLED,
+            "model":         config.FLAN_MODEL if config.FLAN_ENABLED else None,
+            "latency_ms":    latency_ms,
             "critique_stats": {"corrected": 0, "kept": len(segments), "total": len(segments)},
         }
 
-    to_correct_texts = [parts[i] for i, need in enumerate(needs_correction) if need]
-    to_correct_indices = [i for i, need in enumerate(needs_correction) if need]
-
-    corrected_parts = parts.copy()
+    to_correct_texts   = [parts[i] for i, need in enumerate(needs_correction) if need]
+    to_correct_indices = [i        for i, need in enumerate(needs_correction) if need]
+    corrected_parts    = parts.copy()
 
     if to_correct_texts:
         batch_results = _batch_correct_segments(to_correct_texts)
         for idx_in_batch, seg_idx in enumerate(to_correct_indices):
             corrected_parts[seg_idx] = batch_results[idx_in_batch]
 
-    corrected_text = " ".join(corrected_parts).strip()
-    latency_ms = round((time.perf_counter() - t0) * 1000)
-
+    corrected_text  = " ".join(corrected_parts).strip()
+    latency_ms      = round((time.perf_counter() - t0) * 1000)
     corrected_count = sum(1 for p, o in zip(corrected_parts, parts) if p != o)
-    kept_count = len(parts) - corrected_count
+    kept_count      = len(parts) - corrected_count
 
-    log.info("Whisper+Flan-T5 — %d seg(s) | %d corrected | %d kept | %dms",
+    log.info("Whisper+Flan-T5 -- %d seg(s) | %d corrected | %d kept | %dms",
              len(segments), corrected_count, kept_count, latency_ms)
 
+    _log_questions_terminal(corrected_text, source="upload")
+
     whisper_result = {
-        "text": text,
+        "text":       text,
         "word_count": len(text.split()) if text else 0,
-        "segments": segments,
+        "segments":   segments,
     }
     correction_result = {
-        "corrected": corrected_text,
-        "enabled": True,
-        "model": config.FLAN_MODEL,
+        "corrected":  corrected_text,
+        "enabled":    True,
+        "model":      config.FLAN_MODEL,
         "latency_ms": latency_ms,
         "critique_stats": {
             "corrected": corrected_count,
-            "kept": kept_count,
-            "total": len(segments),
+            "kept":      kept_count,
+            "total":     len(segments),
         },
     }
     return whisper_result, correction_result
 
 
-# ── Standalone text correction (segment-level, no splitting) ──────────────────
+# -- Standalone text correction -----------------------------------------------
 
 def correct_text(text: str) -> dict:
     """Run Flan-T5 correction on full text as single segment."""
     if not config.FLAN_ENABLED or not text or not text.strip():
-        return {"corrected": text, "enabled": config.FLAN_ENABLED,
-                "model": config.FLAN_MODEL if config.FLAN_ENABLED else None, "latency_ms": 0}
+        return {
+            "corrected":  text,
+            "enabled":    config.FLAN_ENABLED,
+            "model":      config.FLAN_MODEL if config.FLAN_ENABLED else None,
+            "latency_ms": 0,
+        }
 
     model, tokenizer = load_flan()
     if model is None or tokenizer is None:
         return {"corrected": text, "enabled": False, "model": None, "latency_ms": 0}
 
     import torch
-    device = next(model.parameters()).device
-
+    device  = next(model.parameters()).device
     t_start = time.perf_counter()
 
     inputs = tokenizer(
@@ -229,14 +307,14 @@ def correct_text(text: str) -> dict:
             no_repeat_ngram_size=2,
         )
 
-    corrected = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    corrected  = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
     latency_ms = round((time.perf_counter() - t_start) * 1000)
 
-    log.info("Flan-T5 correction done — %dms", latency_ms)
+    log.info("Flan-T5 correction done -- %dms", latency_ms)
 
     return {
-        "corrected": corrected,
-        "enabled": True,
-        "model": config.FLAN_MODEL,
+        "corrected":  corrected,
+        "enabled":    True,
+        "model":      config.FLAN_MODEL,
         "latency_ms": latency_ms,
     }

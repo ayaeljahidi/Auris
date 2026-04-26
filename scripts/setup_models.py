@@ -1,5 +1,5 @@
 """
-Auris — Model Setup Script (CPU-only, FFmpeg-free, VAD-free)
+Auris -- Model Setup Script (CPU-only, FFmpeg-free, VAD-free)
 Downloads and verifies all required models and dependencies.
 
 Usage:
@@ -12,13 +12,13 @@ import tempfile
 import wave
 from pathlib import Path
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# -- Constants -----------------------------------------------------------------
 
-FLAN_MODEL = os.environ.get("FLAN_MODEL", "google/flan-t5-base")
-FLAN_DIR   = Path("models/flan-t5-base")
+FLAN_MODEL    = os.environ.get("FLAN_MODEL",    "google/flan-t5-base")
+FLAN_DIR      = Path("models/flan-t5-base")
+QGEN_MODEL    = os.environ.get("QGEN_MODEL",    "valhalla/t5-base-qg-hl")
+QGEN_DIR      = Path("models/t5-base-qg-hl")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
-EMOTION_MODEL = os.environ.get("EMOTION_MODEL", "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition")
-EMOTION_DIR   = Path("models/emotion")
 
 # Exact packages from requirements.txt
 REQUIRED_PACKAGES = {
@@ -34,10 +34,10 @@ REQUIRED_PACKAGES = {
     "onnxruntime":    "onnxruntime>=1.20.0",
 }
 
-LINE = "─" * 60
+LINE = "-" * 60
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------------
 
 def header(text: str) -> None:
     print(f"\n{LINE}")
@@ -49,9 +49,9 @@ def step(n: int, total: int, text: str) -> None:
     print(f"\n[{n}/{total}] {text}")
 
 
-def ok(msg: str)   -> None: print(f"  ✓  {msg}")
-def warn(msg: str) -> None: print(f"  !  {msg}")
-def err(msg: str)  -> None: print(f"  ✗  {msg}")
+def ok(msg: str)   -> None: print(f"  OK  {msg}")
+def warn(msg: str) -> None: print(f"  !   {msg}")
+def err(msg: str)  -> None: print(f"  ERR {msg}")
 
 
 def check_python() -> None:
@@ -61,7 +61,7 @@ def check_python() -> None:
     ok(f"Python {sys.version_info.major}.{sys.version_info.minor}")
 
 
-# ── Step implementations ───────────────────────────────────────────────────────
+# -- Step implementations ------------------------------------------------------
 
 
 def check_packages() -> None:
@@ -113,7 +113,7 @@ def download_flan() -> None:
     try:
         from transformers import T5ForConditionalGeneration, T5Tokenizer
     except ImportError:
-        err("transformers not installed — cannot download Flan-T5")
+        err("transformers not installed -- cannot download Flan-T5")
         sys.exit(1)
 
     FLAN_DIR.mkdir(parents=True, exist_ok=True)
@@ -127,48 +127,60 @@ def download_flan() -> None:
     print(f"  Downloading {FLAN_MODEL} (CPU-optimized, ~1 GB)...")
     print("  This may take a few minutes on first run.")
     try:
+        import torch
         tokenizer = T5Tokenizer.from_pretrained(FLAN_MODEL, cache_dir=str(FLAN_DIR))
         model = T5ForConditionalGeneration.from_pretrained(
             FLAN_MODEL,
-            torch_dtype="auto",
+            torch_dtype=torch.float32,
             device_map="cpu",
             cache_dir=str(FLAN_DIR),
         )
+        model.eval()
+        # Force full weight materialisation before returning
+        dummy = tokenizer("warmup", return_tensors="pt")
+        with torch.no_grad():
+            model.generate(**dummy, max_new_tokens=1)
         ok(f"Flan-T5 ({FLAN_MODEL}) downloaded and ready")
     except Exception as exc:
         err(f"Flan-T5 download failed: {exc}")
         sys.exit(1)
 
 
-def download_emotion() -> None:
-    """Download DistilHuBERT emotion model using transformers (CPU-friendly)."""
+def download_qgen() -> None:
+    """Download T5-QG model using transformers (CPU-friendly)."""
     try:
-        from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
+        from transformers import T5ForConditionalGeneration, T5Tokenizer
     except ImportError:
-        err("transformers not installed — cannot download emotion model")
+        err("transformers not installed -- cannot download T5-QG")
         sys.exit(1)
 
-    EMOTION_DIR.mkdir(parents=True, exist_ok=True)
+    QGEN_DIR.mkdir(parents=True, exist_ok=True)
 
     cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
-    model_name_safe = EMOTION_MODEL.replace("/", "--")
+    model_name_safe = QGEN_MODEL.replace("/", "--")
     if any(model_name_safe in str(p) for p in cache_dir.glob("*")):
-        ok(f"Emotion model already cached")
+        ok(f"T5-QG already cached")
         return
 
-    print(f"  Downloading {EMOTION_MODEL} (CPU-optimized, ~23 MB)...")
+    print(f"  Downloading {QGEN_MODEL} (CPU-optimized, ~220 MB)...")
     print("  This may take a few minutes on first run.")
     try:
-        extractor = AutoFeatureExtractor.from_pretrained(EMOTION_MODEL, cache_dir=str(EMOTION_DIR))
-        model = AutoModelForAudioClassification.from_pretrained(
-            EMOTION_MODEL,
+        import torch
+        tokenizer = T5Tokenizer.from_pretrained(QGEN_MODEL, cache_dir=str(QGEN_DIR))
+        model = T5ForConditionalGeneration.from_pretrained(
+            QGEN_MODEL,
             torch_dtype=torch.float32,
             device_map="cpu",
-            cache_dir=str(EMOTION_DIR),
+            cache_dir=str(QGEN_DIR),
         )
-        ok(f"Emotion model ({EMOTION_MODEL}) downloaded and ready")
+        model.eval()
+        # Force full weight materialisation before returning
+        dummy = tokenizer("warmup", return_tensors="pt")
+        with torch.no_grad():
+            model.generate(**dummy, max_new_tokens=1)
+        ok(f"T5-QG ({QGEN_MODEL}) downloaded and ready")
     except Exception as exc:
-        err(f"Emotion model download failed: {exc}")
+        err(f"T5-QG download failed: {exc}")
         sys.exit(1)
 
 
@@ -179,7 +191,6 @@ def warmup_whisper() -> None:
 
         model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=4)
 
-        # 1 second of silence as in-memory WAV
         silence = np.zeros(16_000, dtype=np.int16)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
@@ -188,7 +199,6 @@ def warmup_whisper() -> None:
             w.setframerate(16_000)
             w.writeframes(silence.tobytes())
 
-        # faster-whisper accepts bytes directly via numpy array
         audio = silence.astype(np.float32) / 32768.0
         list(model.transcribe(audio, beam_size=1)[0])
         ok(f"faster-whisper ({WHISPER_MODEL} / int8 / CPU) warmed up")
@@ -219,36 +229,33 @@ def warmup_flan() -> None:
         warn(f"Flan-T5 warmup failed: {exc}")
 
 
-def warmup_emotion() -> None:
-    """Warm up emotion model with a tiny inference."""
+def warmup_qgen() -> None:
+    """Warm up T5-QG with a tiny inference."""
     try:
-        from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
-        import numpy as np
+        from transformers import T5ForConditionalGeneration, T5Tokenizer
+        import torch
 
-        extractor = AutoFeatureExtractor.from_pretrained(EMOTION_MODEL, cache_dir=str(EMOTION_DIR))
-        model = AutoModelForAudioClassification.from_pretrained(
-            EMOTION_MODEL,
+        tokenizer = T5Tokenizer.from_pretrained(QGEN_MODEL, cache_dir=str(QGEN_DIR))
+        model = T5ForConditionalGeneration.from_pretrained(
+            QGEN_MODEL,
             torch_dtype=torch.float32,
             device_map="cpu",
-            cache_dir=str(EMOTION_DIR),
+            cache_dir=str(QGEN_DIR),
         )
         model.eval()
 
-        # 1 second of silence
-        audio = np.zeros(16_000, dtype=np.float32)
-        inputs = extractor(audio, sampling_rate=16_000, return_tensors="pt")
+        inputs = tokenizer("generate question: test context", return_tensors="pt")
         with torch.no_grad():
-            _ = model(**inputs)
-        ok(f"Emotion model ({EMOTION_MODEL} / CPU / float32) warmed up")
+            _ = model.generate(**inputs, max_new_tokens=8)
+        ok(f"T5-QG ({QGEN_MODEL} / CPU / float32) warmed up")
     except Exception as exc:
-        warn(f"Emotion warmup failed: {exc}")
+        warn(f"T5-QG warmup failed: {exc}")
 
 
 def warmup_pyav() -> None:
     """Verify PyAV is working correctly."""
     try:
         import av
-        # Just verify we can create a resampler
         resampler = av.audio.resampler.AudioResampler(
             format="s16", layout="mono", rate=16000
         )
@@ -258,17 +265,17 @@ def warmup_pyav() -> None:
         sys.exit(1)
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 
 def main() -> None:
-    header("Auris — Model Setup (CPU-only, FFmpeg-free)")
-    print("  Pipeline:  PyAV → faster-whisper → Flan-T5 (critique-gated) → DistilHuBERT-emotion")
-    print("  No system FFmpeg required — PyAV bundles its own codecs")
-    print("  No VAD — frontend noise gate handles pre-filtering")
+    header("Auris -- Model Setup (CPU-only, FFmpeg-free)")
+    print("  Pipeline:  PyAV -> faster-whisper -> Flan-T5 (critique) -> T5-QG (questions)")
+    print("  No system FFmpeg required -- PyAV bundles its own codecs")
+    print("  No VAD -- frontend noise gate handles pre-filtering")
 
     check_python()
 
-    TOTAL = 6
+    TOTAL = 5
     step(1, TOTAL, "Python packages")
     check_packages()
 
@@ -281,13 +288,16 @@ def main() -> None:
     step(4, TOTAL, f"Flan-T5 model ({FLAN_MODEL})")
     download_flan()
 
-    step(5, TOTAL, f"Emotion model ({EMOTION_MODEL})")
-    download_emotion()
+    step(5, TOTAL, f"T5-QG model ({QGEN_MODEL})")
+    download_qgen()
 
-    step(6, TOTAL, "Model warmups")
+    # Warmups run after all downloads, no step counter shown
+    print(f"\n[warmup] faster-whisper")
     warmup_whisper()
+    print(f"[warmup] Flan-T5")
     warmup_flan()
-    warmup_emotion()
+    print(f"[warmup] T5-QG")
+    warmup_qgen()
 
     print(f"\n{LINE}")
     print("  Setup complete!\n")
