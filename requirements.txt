@@ -17,4 +17,4 @@ torch>=2.5.0                      # CPU-only wheel installed via index-url below
 sentencepiece>=0.2.0              # T5 tokenizer requirement
 
 # ── ONNX (kept for any future ONNX models) ─────────────────────────────────────
-onnxruntime>=1.20.0              
+onnxruntime>=1.20.0
