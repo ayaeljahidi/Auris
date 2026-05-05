@@ -1,0 +1,28 @@
+# ===== Python cache =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ===== Virtual environment =====
+venv/
+env/
+.venv/
+ENV/
+
+# ===== Models (AI / ML) =====
+models/
+# ===== Logs =====
+*.log
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db
+
+# ===== IDE =====
+.vscode/
+.idea/
+
+# ===== Environment variables =====
+.env
+.env.*

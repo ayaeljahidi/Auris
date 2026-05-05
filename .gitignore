@@ -1,0 +1,22 @@
+# Python virtual environments
+venv/
+Auris/venv/
+
+# AI Models (Largest files)
+Auris/models/
+Auris/scripts/models/
+**/models/emotion/
+**/models/flan-t5-base/
+**/models/flan-t5-large/
+**/models/qwen2.5-1.5b-inst/
+**/models/t5-qg/
+
+# Python cache
+__pycache__/
+Auris/backend/__pycache__/
+
+# Web dependencies
+node_modules/
+
+# Environment secrets
+.env

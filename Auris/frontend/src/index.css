@@ -1,0 +1,99 @@
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Sans:wght@300;400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --blue: #1E40AF;
+  --gold: #F59E0B;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'DM Sans', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4 {
+  font-family: 'Syne', sans-serif;
+}
+
+@keyframes gradientShift {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+@keyframes waveform {
+  0%, 100% { transform: scaleY(0.4); }
+  50%       { transform: scaleY(1); }
+}
+
+@keyframes pulseRing {
+  0%   { transform: scale(0.8); opacity: 1; }
+  100% { transform: scale(2); opacity: 0; }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% center; }
+  100% { background-position: 200% center; }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50%       { transform: translateY(-10px); }
+}
+
+.gradient-hero {
+  background: linear-gradient(-45deg, #0f172a, #1e3a8a, #0f172a, #1e1b4b, #0c1a3a);
+  background-size: 400% 400%;
+  animation: gradientShift 12s ease infinite;
+}
+
+.gradient-hero-light {
+  background: linear-gradient(-45deg, #dbeafe, #eff6ff, #fef3c7, #dbeafe, #e0f2fe);
+  background-size: 400% 400%;
+  animation: gradientShift 12s ease infinite;
+}
+
+.shimmer-btn {
+  background: linear-gradient(90deg, #1E40AF 0%, #F59E0B 50%, #1E40AF 100%);
+  background-size: 200% auto;
+  animation: shimmer 3s linear infinite;
+}
+
+.waveform-bar {
+  animation: waveform 1s ease-in-out infinite;
+}
+
+.pulse-ring {
+  animation: pulseRing 1.5s ease-out infinite;
+}
+
+.float-anim {
+  animation: float 4s ease-in-out infinite;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1E40AF; border-radius: 3px; }
+
+/* Glass effect */
+.glass {
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+/* Gold glow */
+.gold-glow {
+  box-shadow: 0 0 20px rgba(245, 158, 11, 0.4);
+}
+
+.blue-glow {
+  box-shadow: 0 0 20px rgba(30, 64, 175, 0.5);
+}
