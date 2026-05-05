@@ -16,7 +16,7 @@ from .audio import extract_audio_to_numpy, pcm_to_wav, audio_duration_from_array
 from .models import load_whisper, load_flan, health_status
 from .transcribe import transcribe_whisper, transcribe_whisper_with_correction
 from . import config
-from .qwen_remarks import generate_remarks   
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  [%(levelname)-8s]  %(name)s — %(message)s",
@@ -91,29 +91,6 @@ async def generate_from_transcript(body: TranscriptInput):
         word_count=len(body.text.split()),
         model="Qwen2.5-5B",
     )
-
-@app.post("/remarks/generate", response_model=RemarksOutput)
-async def generate_speech_remarks(body: TranscriptInput):
-    if not body.text.strip():
-        raise HTTPException(status_code=400, detail="Text cannot be empty.")
-    if len(body.text.split()) < 20:
-        raise HTTPException(status_code=400, detail="Text too short.")
-
-    loop = asyncio.get_event_loop()
-    try:
-        remarks = await asyncio.wait_for(
-            loop.run_in_executor(None, partial(generate_remarks, body.text)),
-            timeout=300
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Generation timed out.")
-
-    return RemarksOutput(
-        remarks=remarks,
-        word_count=len(body.text.split()),
-        model="qwen2.5:7b",
-    )
-
 
 
 

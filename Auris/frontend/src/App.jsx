@@ -5,7 +5,7 @@ import Navbar from './components/Navbar'
 import Landing from './pages/Landing'
 import Upload from './pages/Upload'
 import QuestionTest from "./pages/QuestionTest";
-import SpeechRemarks from "./pages/SpeechRemarks";
+
 export default function App() {
   const [darkMode, setDarkMode] = useState(true)
   const location = useLocation()
@@ -23,7 +23,7 @@ export default function App() {
             <Route path="/test" element={<QuestionTest />} />
             <Route path="/" element={<Landing darkMode={darkMode} />} />
             <Route path="/upload" element={<Upload darkMode={darkMode} />} />
-            <Route path="/speech-remarks" element={<SpeechRemarks darkMode={darkMode} />} />
+          
           </Routes>
         </AnimatePresence>
       </div>
