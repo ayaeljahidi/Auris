@@ -1,26 +1,32 @@
-"""Auris — Transcription engine with streaming Flan-T5 correction
+"""Auris — Transcription engine with streaming Flan-T5 correction + QG
 
-Pipeline architecture (3-way parallel):
+Pipeline architecture (4-way parallel):
   ┌─────────────┐   Queue   ┌─────────────┐
   │   Whisper   │ ─────────▶│   Flan-T5   │   (overlap: Flan starts on seg-1
   │  (iterator) │           │  consumer   │    while Whisper decodes seg-2…N)
   └─────────────┘           └─────────────┘
-         │                                          Both run concurrently with:
-         └──────────────────────────────────────▶  ┌──────────────┐
+         │                        │
+         │                        └─── corrected_text ──▶ ┌──────────────┐
+         │                                                  │  Qwen QG     │
+         │                                                  │  (Ollama)    │
+         └──────────────────────────────────────────────▶  └──────────────┘
+                                                    AND:
+                                                    ┌──────────────┐
                                                     │   Emotion    │
                                                     │  (parallel)  │
                                                     └──────────────┘
 
-Key change vs previous version:
-  BEFORE: Whisper runs fully → then Flan runs on all segments (sequential phases)
-  AFTER:  Whisper streams segments into a queue; Flan corrects each one immediately
-          → Flan latency is hidden inside Whisper decode time.
-          For 17 segments the savings are roughly (N-1) × flan_per_segment_ms.
+Timeline:
+  [=====Whisper======]
+          [=Flan s1=][=s2=][=s3=]…  ← Flan overlaps Whisper
+  [==========Emotion===========]    ← fully independent
+                                [==Qwen QG==]  ← starts after Flan completes,
+                                                  overlaps with tail of Emotion
 """
 import logging
 import queue
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future
 
 import numpy as np
 import torch
@@ -30,7 +36,7 @@ from . import config
 
 log = logging.getLogger("auris.transcribe")
 
-# Import emotion function (no circular import)
+# Import emotion function
 try:
     from .emotion import detect_emotion_global
     EMOTION_AVAILABLE = True
@@ -38,7 +44,14 @@ except ImportError:
     EMOTION_AVAILABLE = False
     log.warning("Emotion module not available")
 
-# Sentinel pushed by Whisper thread to signal end-of-stream to Flan consumer
+# Import QG function
+try:
+    from .qwen_questions import generate_questions
+    QG_AVAILABLE = True
+except ImportError:
+    QG_AVAILABLE = False
+    log.warning("QG module not available — install Ollama + qwen2.5:1.5b")
+
 _SENTINEL = object()
 
 
@@ -88,8 +101,7 @@ def _whisper_producer(audio: np.ndarray, seg_queue: "queue.Queue") -> None:
     Whisper producer thread.
     Streams segments into seg_queue as soon as each one is decoded.
     Pushes _SENTINEL when done.
-
-    Each item pushed: (index, seg_dict, raw_text, needs_correction: bool)
+    Each item: (index, seg_dict, raw_text, needs_correction: bool)
     """
     try:
         seg_iter, _ = load_whisper().transcribe(
@@ -117,7 +129,7 @@ def _whisper_producer(audio: np.ndarray, seg_queue: "queue.Queue") -> None:
 
 
 def _correct_one(text: str, model, tokenizer, device) -> str:
-    """Run Flan-T5 on a single segment text. Returns corrected text."""
+    """Run Flan-T5 on a single segment text."""
     inputs = tokenizer(
         f"Fix grammar: {text}",
         return_tensors="pt",
@@ -139,22 +151,21 @@ def _correct_one(text: str, model, tokenizer, device) -> str:
 
 def _flan_consumer(
     seg_queue: "queue.Queue",
-    results: list,          # pre-sized list, written by index
-    stats: dict,            # mutated in-place: corrected / kept counts
+    results: list,
+    stats: dict,
 ) -> None:
     """
     Flan-T5 consumer thread.
     Pops segments from the queue and corrects them immediately.
-    Runs concurrently with _whisper_producer so Flan latency is overlapped.
+    Runs concurrently with _whisper_producer.
     """
     if not config.FLAN_ENABLED:
-        # Drain queue without correction; results filled by _collect_uncorrected
         while True:
             item = seg_queue.get()
             if item is _SENTINEL:
                 break
             idx, seg_dict, raw_text, _ = item
-            results[idx] = (seg_dict, raw_text, raw_text)  # (seg, raw, corrected)
+            results[idx] = (seg_dict, raw_text, raw_text)
         return
 
     model, tokenizer = load_flan()
@@ -196,7 +207,7 @@ def _flan_consumer(
         results[idx] = (seg_dict, raw_text, corrected)
 
 
-# ── Emotion helper (unchanged interface) ──────────────────────────────────────
+# ── Emotion helper ─────────────────────────────────────────────────────────────
 
 def _run_emotion(audio: np.ndarray) -> dict:
     """Emotion detection — runs in its own thread."""
@@ -210,7 +221,64 @@ def _run_emotion(audio: np.ndarray) -> dict:
     return detect_emotion_global(audio, sr=config.EMOTION_SR)
 
 
-# ── Batch correction (kept for _batch_correct_segments callers) ───────────────
+# ── QG helper ─────────────────────────────────────────────────────────────────
+
+def _run_qg(corrected_text: str) -> dict:
+    """
+    Question generation via Qwen/Ollama.
+    Runs AFTER Flan completes (needs full corrected transcript).
+    Returns a questions_result dict — always safe to call, returns
+    a graceful failure dict if Ollama is not available.
+    """
+    _empty = {
+        "enabled": False,
+        "questions": [],
+        "raw": "",
+        "latency_ms": 0,
+        "error": None,
+    }
+
+    if not QG_AVAILABLE:
+        return {**_empty, "error": "qwen_questions module not found"}
+
+    if not corrected_text or not corrected_text.strip():
+        return {**_empty, "error": "empty transcript — no questions generated"}
+
+    t0 = time.perf_counter()
+    try:
+        raw = generate_questions(corrected_text)
+        latency_ms = round((time.perf_counter() - t0) * 1000)
+
+        # Parse numbered lines into a clean list
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        questions = []
+        for ln in lines:
+            # Strip leading "1." / "2." etc.
+            if ln and ln[0].isdigit() and len(ln) > 2 and ln[1] in ".):":
+                questions.append(ln[2:].strip())
+            elif ln:
+                questions.append(ln)
+
+        return {
+            "enabled":    True,
+            "questions":  questions,
+            "raw":        raw,
+            "latency_ms": latency_ms,
+            "error":      None,
+        }
+
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - t0) * 1000)
+        log.error("QG failed: %s", exc)
+        return {
+            **_empty,
+            "enabled":    True,   # was attempted
+            "latency_ms": latency_ms,
+            "error":      str(exc),
+        }
+
+
+# ── Batch correction (kept for external callers) ──────────────────────────────
 
 def _batch_correct_segments(texts: list[str]) -> list[str]:
     """Batch Flan-T5 — kept for external callers; streaming path is preferred."""
@@ -235,69 +303,89 @@ def _batch_correct_segments(texts: list[str]) -> list[str]:
     return [tokenizer.decode(out, skip_special_tokens=True).strip() for out in outputs]
 
 
-# ── Main pipeline ──────────────────────────────────────────────────────────────
+# ── Main 4-way pipeline ────────────────────────────────────────────────────────
 
-def transcribe_whisper_with_correction_and_emotion(audio: np.ndarray) -> tuple[dict, dict, dict]:
+def transcribe_whisper_with_correction_and_emotion(
+    audio: np.ndarray,
+    run_qg: bool = True,
+) -> tuple[dict, dict, dict, dict]:
     """
-    Three-way parallel pipeline:
+    Four-way pipeline:
 
-      Thread-1  Whisper       — streams segments into a queue as decoded
+      Thread-1  Whisper       — streams segments into a bounded queue
       Thread-2  Flan-T5       — consumes queue, corrects each segment immediately
-      Thread-3  Emotion ONNX  — runs on full audio independently
+      Thread-3  Emotion ONNX  — runs on full audio independently (full parallel)
 
-    Flan-T5 now overlaps with Whisper decode instead of running after it.
-    For 17 segments at ~200ms/segment Flan latency this saves ~3 seconds.
+      After Threads 1+2 complete:
+      Thread-4  Qwen QG       — launched with corrected_text, may overlap
+                                 with Thread-3 tail if Emotion is still running
 
-    Timeline (old):
-      [=====Whisper=====][===Flan batch===][Emotion]
-                                                     ^ total
-
-    Timeline (new):
+    Timeline:
       [=====Whisper======]
-              [=Flan seg1=][=seg2=][=seg3=]…   (starts on seg-1 arrival)
+              [=Flan s1=][=s2=]…
       [==========Emotion===========]
-                                   ^ total  (Flan hidden inside Whisper)
+                                [==Qwen QG==]   ← starts as soon as Flan done
+
+    Args:
+        audio:   float32 numpy array, mono 16 kHz
+        run_qg:  set False to skip QG (e.g. live/real-time mode)
+
+    Returns:
+        (whisper_result, correction_result, emotion_result, questions_result)
     """
     t0 = time.perf_counter()
 
-    # We don't know the segment count upfront; use a growable list protected
-    # by the queue ordering.  We pre-allocate 256 slots (cheap) and trim later.
-    MAX_SEGS = 256
-    results: list = [None] * MAX_SEGS   # results[idx] = (seg_dict, raw, corrected)
+    MAX_SEGS   = 256
+    results    = [None] * MAX_SEGS
     flan_stats = {"corrected": 0, "kept": 0}
-
-    # Bounded queue: Whisper can run 2 segments ahead of Flan (back-pressure)
     seg_queue: queue.Queue = queue.Queue(maxsize=4)
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        # Thread 1: Whisper producer
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        # Thread 1 + 2: Whisper→queue→Flan (streaming overlap)
         future_whisper = executor.submit(_whisper_producer, audio, seg_queue)
-        # Thread 2: Flan consumer (starts immediately, blocks on queue.get)
         future_flan    = executor.submit(_flan_consumer, seg_queue, results, flan_stats)
-        # Thread 3: Emotion (full audio, independent)
+        # Thread 3: Emotion — fully independent, runs the whole time
         future_emotion = executor.submit(_run_emotion, audio)
 
-        # Wait for both Whisper and Flan to finish
+        # Wait for Whisper + Flan to finish before launching QG
         future_whisper.result()
         future_flan.result()
+
+        # Assemble corrected text (needed by QG)
+        ordered_partial = [r for r in results if r is not None]
+        corrected_parts = [corrected for _, _, corrected in ordered_partial]
+        corrected_text  = " ".join(corrected_parts).strip()
+
+        # Thread 4: QG — starts now, may overlap with Emotion tail
+        future_qg: Future = (
+            executor.submit(_run_qg, corrected_text)
+            if run_qg
+            else executor.submit(lambda: {
+                "enabled": False, "questions": [], "raw": "",
+                "latency_ms": 0, "error": "skipped (live mode)",
+            })
+        )
+
+        # Collect remaining results
         emotion_data = future_emotion.result()
+        qg_data      = future_qg.result()
 
     t_pipeline = round((time.perf_counter() - t0) * 1000)
 
-    # Collect ordered results (trim None slots)
+    # ── Assemble final results ─────────────────────────────────────────────────
     ordered = [r for r in results if r is not None]
 
     segments:        list[dict] = []
     raw_parts:       list[str]  = []
-    corrected_parts: list[str]  = []
+    corrected_parts2: list[str] = []
 
     for seg_dict, raw, corrected in ordered:
         segments.append(seg_dict)
         raw_parts.append(raw)
-        corrected_parts.append(corrected)
+        corrected_parts2.append(corrected)
 
     text           = " ".join(raw_parts).strip()
-    corrected_text = " ".join(corrected_parts).strip()
+    corrected_text = " ".join(corrected_parts2).strip()
     total_segs     = len(segments)
     corrected_count = flan_stats["corrected"]
     kept_count      = flan_stats["kept"]
@@ -321,31 +409,41 @@ def transcribe_whisper_with_correction_and_emotion(audio: np.ndarray) -> tuple[d
     }
 
     emotion_result = {
-        "enabled":        emotion_data.get("enabled", config.EMOTION_ENABLED),
-        "emotion":        emotion_data.get("emotion", "unknown"),
-        "confidence":     emotion_data.get("confidence", 0.0),
-        "latency_ms":     emotion_data.get("latency_ms", 0),
-        "is_reliable":    emotion_data.get("is_reliable", False),
-        "all_probs":      emotion_data.get("all_probs", {}),
+        "enabled":         emotion_data.get("enabled", config.EMOTION_ENABLED),
+        "emotion":         emotion_data.get("emotion", "unknown"),
+        "confidence":      emotion_data.get("confidence", 0.0),
+        "latency_ms":      emotion_data.get("latency_ms", 0),
+        "is_reliable":     emotion_data.get("is_reliable", False),
+        "all_probs":       emotion_data.get("all_probs", {}),
         "realtime_factor": emotion_data.get("realtime_factor", 0),
-        "inference_ms":   emotion_data.get("inference_ms", 0),
+        "inference_ms":    emotion_data.get("inference_ms", 0),
+    }
+
+    questions_result = {
+        "enabled":    qg_data.get("enabled", False),
+        "questions":  qg_data.get("questions", []),
+        "raw":        qg_data.get("raw", ""),
+        "latency_ms": qg_data.get("latency_ms", 0),
+        "error":      qg_data.get("error"),
     }
 
     log.info(
-        "✅ Pipeline — whisper:%d seg | flan:+%d/=%d | emotion:%s(%.1f%%) | total:%dms | %.1fx realtime",
+        "✅ Pipeline — whisper:%d seg | flan:+%d/=%d | emotion:%s(%.1f%%) "
+        "| qg:%d questions | total:%dms | %.1fx realtime",
         total_segs, corrected_count, kept_count,
         emotion_result["emotion"], emotion_result["confidence"] * 100,
+        len(questions_result["questions"]),
         t_pipeline, emotion_result.get("realtime_factor", 0),
     )
 
-    return whisper_result, correction_result, emotion_result
+    return whisper_result, correction_result, emotion_result, questions_result
 
 
-# ── Convenience wrappers (unchanged signatures) ───────────────────────────────
+# ── Convenience wrappers (backwards-compatible signatures) ────────────────────
 
 def transcribe_whisper_with_correction(audio: np.ndarray) -> tuple[dict, dict]:
-    """Decode with Whisper + streaming Flan-T5 correction."""
-    wr, cr, _ = transcribe_whisper_with_correction_and_emotion(audio)
+    """Decode with Whisper + streaming Flan-T5 correction (no emotion, no QG)."""
+    wr, cr, _, _ = transcribe_whisper_with_correction_and_emotion(audio, run_qg=False)
     return wr, cr
 
 
@@ -382,4 +480,3 @@ def correct_text(text: str) -> dict:
         "model":      config.FLAN_MODEL,
         "latency_ms": round((time.perf_counter() - t_start) * 1000),
     }
-    
