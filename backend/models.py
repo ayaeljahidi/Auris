@@ -1,41 +1,38 @@
-"""Auris — Model singletons with ONNX Runtime (pre-converted community model)"""
+"""Auris — Model singletons (Whisper + Flan + Wav2Vec2 Emotion)"""
 import logging
 import threading
-import os
-import time
 import numpy as np
 import torch
 from faster_whisper import WhisperModel
 from transformers import (
-    T5ForConditionalGeneration, 
-    T5Tokenizer, 
-    AutoFeatureExtractor,
+    T5ForConditionalGeneration,
+    T5Tokenizer,
+    Wav2Vec2ForSequenceClassification,
+    Wav2Vec2FeatureExtractor,
 )
 
 from . import config
 
 log = logging.getLogger("auris.models")
 
-# ── ONNX Runtime imports ──────────────────────────────────────────────────────
-try:
-    import onnxruntime as ort
-    ONNX_AVAILABLE = True
-except ImportError:
-    ort = None
-    ONNX_AVAILABLE = False
-    log.warning("ONNX Runtime not installed. Install with: pip install onnxruntime")
-
 # ── Singleton state + per-model locks ─────────────────────────────────────────
 _whisper_model:  WhisperModel | None = None
 _flan_model:     T5ForConditionalGeneration | None = None
 _flan_tokenizer: T5Tokenizer | None = None
-_emotion_session: ort.InferenceSession | None = None
-_emotion_extractor: AutoFeatureExtractor | None = None
+_emotion_model:  Wav2Vec2ForSequenceClassification | None = None
+_emotion_processor: Wav2Vec2FeatureExtractor | None = None
 _emotion_labels: list[str] = []
 
 _whisper_lock  = threading.Lock()
 _flan_lock     = threading.Lock()
 _emotion_lock  = threading.Lock()
+
+
+# ── 8-class Wav2Vec2 emotion labels (prithivMLmods/Speech-Emotion-Classification)
+EMOTION_LABELS = [
+    "angry", "calm", "disgust", "fear",
+    "happy", "neutral", "sad", "surprised",
+]
 
 
 def load_whisper() -> WhisperModel:
@@ -84,187 +81,80 @@ def load_flan() -> tuple["T5ForConditionalGeneration", "T5Tokenizer"] | tuple[No
     return _flan_model, _flan_tokenizer
 
 
-def _is_valid_onnx_file(filepath: str) -> bool:
-    """Check if ONNX file exists and is valid (quick validation)."""
-    if not os.path.exists(filepath):
-        return False
-    try:
-        size = os.path.getsize(filepath)
-        if size < 10 * 1024 * 1024:
-            log.warning(f"ONNX file too small: {size} bytes (expected >10MB)")
-            return False
-    except Exception:
-        return False
-    return True
+# ── Wav2Vec2 Emotion loader (standard Transformers, no compilation) ───────────
 
-
-def _download_onnx_model_from_hf(cache_dir: str) -> str | None:
-    """Download pre-converted ONNX model from Hugging Face Hub."""
-    try:
-        from huggingface_hub import hf_hub_download, list_repo_files
-
-        log.info("Downloading ONNX model from HF: %s", config.EMOTION_MODEL)
-
-        # List files in repo to find ONNX model
-        files = list_repo_files(config.EMOTION_MODEL)
-        onnx_files = [f for f in files if f.endswith('.onnx')]
-
-        if not onnx_files:
-            log.error("No ONNX files found in repo %s", config.EMOTION_MODEL)
-            return None
-
-        # Prefer model.onnx or the largest ONNX file
-        target_file = 'model.onnx' if 'model.onnx' in onnx_files else onnx_files[0]
-
-        downloaded_path = hf_hub_download(
-            repo_id=config.EMOTION_MODEL,
-            filename=target_file,
-            cache_dir=cache_dir,
-            local_dir=cache_dir,
-            local_dir_use_symlinks=False,
-        )
-
-        log.info("✓ ONNX model downloaded: %s", downloaded_path)
-        return downloaded_path
-
-    except Exception as exc:
-        log.error("Failed to download ONNX model: %s", exc)
-        return None
-
-
-def _load_labels_from_hf() -> list[str]:
-    """Load emotion labels from the original model config."""
-    global _emotion_labels
-
-    try:
-        from transformers import AutoConfig
-        # Labels are in the original Dpngtm model, but we can infer from ONNX repo
-        # or use the known 7-class mapping
-        config_obj = AutoConfig.from_pretrained(
-            config.EMOTION_MODEL,
-            cache_dir=config.EMOTION_CACHE_DIR,
-            trust_remote_code=True,
-        )
-        if hasattr(config_obj, 'id2label') and config_obj.id2label:
-            _emotion_labels = [config_obj.id2label[i] for i in range(len(config_obj.id2label))]
-            log.info("Labels loaded from HF config: %s", _emotion_labels)
-            return _emotion_labels
-    except Exception:
-        pass
-
-    # Fallback: known labels for this model (neutral replaces calm)
-    _emotion_labels = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
-    log.info("Using default labels: %s", _emotion_labels)
-    return _emotion_labels
-
-
-def load_emotion_model() -> tuple[ort.InferenceSession | None, AutoFeatureExtractor | None]:
-    """
-    Load pre-converted ONNX emotion model from Hugging Face.
-    No PyTorch conversion needed — downloads ONNX directly.
-    """
-    global _emotion_session, _emotion_extractor, _emotion_labels
+def load_emotion_model() -> Wav2Vec2ForSequenceClassification | None:
+    """Load Wav2Vec2 emotion model (CPU, standard Transformers API)."""
+    global _emotion_model, _emotion_processor, _emotion_labels
 
     if not config.EMOTION_ENABLED:
-        return None, None
+        return None
 
-    if _emotion_session is not None:
-        return _emotion_session, _emotion_extractor
+    if _emotion_model is not None:
+        return _emotion_model
 
     with _emotion_lock:
-        if _emotion_session is not None:
-            return _emotion_session, _emotion_extractor
+        if _emotion_model is not None:
+            return _emotion_model
 
-        log.info("Loading emotion ONNX model: %s", config.EMOTION_MODEL)
+        log.info("Loading Wav2Vec2 emotion model: %s", config.EMOTION_MODEL)
 
         try:
-            # Ensure cache directory exists
-            os.makedirs(config.EMOTION_CACHE_DIR, exist_ok=True)
-
-            # Load feature extractor from the ONNX repo (has preprocessor_config.json)
-            _emotion_extractor = AutoFeatureExtractor.from_pretrained(
+            _emotion_processor = Wav2Vec2FeatureExtractor.from_pretrained(
                 config.EMOTION_MODEL,
-                cache_dir=config.EMOTION_CACHE_DIR,
-                trust_remote_code=True,
             )
-
-            # Download ONNX model if not cached
-            onnx_path = os.path.join(config.EMOTION_CACHE_DIR, "model.onnx")
-
-            if not _is_valid_onnx_file(onnx_path):
-                log.info("ONNX model not found locally — downloading from Hugging Face...")
-                downloaded = _download_onnx_model_from_hf(config.EMOTION_CACHE_DIR)
-                if downloaded and downloaded != onnx_path:
-                    # Copy/symlink to expected location
-                    import shutil
-                    shutil.copy2(downloaded, onnx_path)
-                    log.info("✓ ONNX model cached at: %s", onnx_path)
-            else:
-                log.info("✓ ONNX model found in cache — loading directly")
-
-            # Load labels
-            _load_labels_from_hf()
-
-            # Configure ONNX Runtime session
-            sess_options = ort.SessionOptions()
-            sess_options.enable_profiling = False
-            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-            sess_options.intra_op_num_threads = config.ONNX_THREADS
-            sess_options.inter_op_num_threads = 1
-            sess_options.add_session_config_entry("session.intra_op.use_prepacked_functions", "1")
-
-            providers = ['CPUExecutionProvider']
-
-            _emotion_session = ort.InferenceSession(
-                onnx_path,
-                sess_options=sess_options,
-                providers=providers
+            _emotion_model = Wav2Vec2ForSequenceClassification.from_pretrained(
+                config.EMOTION_MODEL,
+                torch_dtype=torch.float32,
             )
+            _emotion_model.eval()
 
-            # Log input/output info for debugging
-            inputs = _emotion_session.get_inputs()
-            outputs = _emotion_session.get_outputs()
-            log.info("ONNX model I/O — inputs: %s, outputs: %s",
-                     [i.name for i in inputs], [o.name for o in outputs])
+            # Use model\'s actual label count (should be 8)
+            num_labels = _emotion_model.config.num_labels
+            _emotion_labels = EMOTION_LABELS[:num_labels]
 
-            log.info("✓ ONNX Emotion model loaded (CPU | threads=%d | %d labels)", 
-                     config.ONNX_THREADS, len(_emotion_labels))
+            log.info("✓ Wav2Vec2 emotion loaded (CPU | %d classes | ~378MB)", num_labels)
             log.info("  Labels: %s", _emotion_labels)
 
             # Quick validation
-            test_input = np.random.randn(1, config.EMOTION_SR * 2).astype(np.float32)
-            try:
-                input_name = inputs[0].name
-                test_output = _emotion_session.run(None, {input_name: test_input})
-                log.info("✓ ONNX session validated (output shape: %s)", test_output[0].shape)
-            except Exception as e:
-                log.warning(f"ONNX validation warning: {e}")
+            with torch.no_grad():
+                dummy = torch.zeros(1, config.EMOTION_SR * 2).float()
+                inputs = _emotion_processor(
+                    dummy.squeeze().numpy(),
+                    sampling_rate=config.EMOTION_SR,
+                    return_tensors="pt",
+                )
+                test_out = _emotion_model(**inputs)
+                log.info("✓ Validation passed (logits shape: %s)", test_out.logits.shape)
 
         except Exception as exc:
-            log.error("Failed to load emotion model: %s", exc)
-            return None, None
+            log.error("Failed to load Wav2Vec2 emotion model: %s", exc)
+            _emotion_model = None
+            _emotion_processor = None
+            return None
 
-    return _emotion_session, _emotion_extractor
+    return _emotion_model
 
 
-def get_emotion_session():
-    """Public accessor for persistent ONNX session."""
-    session, _ = load_emotion_model()
-    return session, _emotion_labels
+def get_emotion_session() -> tuple:
+    """Public accessor for emotion model, processor, and labels."""
+    model = load_emotion_model()
+    return model, _emotion_processor, _emotion_labels
 
 
 def health_status() -> dict:
     return {
         "whisper_model":       config.WHISPER_MODEL,
+        "whisper_loaded":      _whisper_model is not None,
         "flan_enabled":        config.FLAN_ENABLED,
         "flan_enabled_live":   config.FLAN_ENABLED_LIVE,
         "flan_model":          config.FLAN_MODEL if config.FLAN_ENABLED else None,
+        "flan_loaded":         _flan_model is not None,
         "emotion_enabled":     config.EMOTION_ENABLED,
         "emotion_model":       config.EMOTION_MODEL if config.EMOTION_ENABLED else None,
-        "emotion_backend":     "onnx" if _emotion_session else "none",
+        "emotion_backend":     "wav2vec2" if _emotion_model else "none",
         "emotion_labels":      _emotion_labels if _emotion_labels else None,
+        "emotion_num_classes": len(_emotion_labels) if _emotion_labels else 0,
         "device":              "cpu",
-        "onnx_threads":        config.ONNX_THREADS,
-        "emotion_parallel_workers": config.EMOTION_PARALLEL_WORKERS,
+        "torch_threads":       config.TORCH_THREADS,
     }

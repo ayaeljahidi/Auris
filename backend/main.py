@@ -24,7 +24,7 @@ from .transcribe import (
     _run_qg,
     _SENTINEL,
 )
-from .emotion import detect_emotion_global, PERSISTENT_SESSION
+from .emotion import detect_emotion_global
 from . import config
 
 # Warm up Ollama on startup (optional — non-blocking)
@@ -40,7 +40,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("auris")
 
-app = FastAPI(title="Auris API", version="17.0-qg", docs_url="/api/docs")
+app = FastAPI(title="Auris API", version="17.0-emotion-wav2vec2", docs_url="/api/docs")
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,7 +57,7 @@ app.add_middleware(
 async def on_startup() -> None:
     """Pre-load ALL models in background threads."""
     log.info("=" * 60)
-    log.info("🚀 Starting Auris v17 — 4-way pipeline (Whisper+Flan+Emotion+QG)")
+    log.info("🚀 Starting Auris v17 — Wav2Vec2 Emotion (8 classes, no compilation)")
     log.info("=" * 60)
 
     log.info("Pre-loading Whisper model...")
@@ -66,13 +66,8 @@ async def on_startup() -> None:
     log.info("Pre-loading Flan-T5 model...")
     await asyncio.to_thread(load_flan)
 
-    log.info("Pre-loading Emotion ONNX model...")
+    log.info("Pre-loading Wav2Vec2 Emotion model (8 classes)...")
     await asyncio.to_thread(load_emotion_model)
-
-    if PERSISTENT_SESSION is not None:
-        log.info("✓ Emotion ONNX session loaded and ready (persistent)")
-    else:
-        log.warning("⚠ Emotion session not available (disabled or error)")
 
     if _OLLAMA_AVAILABLE:
         log.info("Warming up Ollama / Qwen QG model (background)…")
@@ -81,6 +76,7 @@ async def on_startup() -> None:
         log.warning("⚠ Qwen QG not available — install Ollama + qwen2.5:1.5b")
 
     log.info("✓ All models ready — server starting")
+    log.info("Emotion classes: angry, calm, disgust, fear, happy, neutral, sad, surprised")
     log.info("=" * 60)
 
 
@@ -90,13 +86,14 @@ async def on_startup() -> None:
 async def health() -> dict:
     return {
         "status": "ok",
-        "version": "17.0-qg",
+        "version": "17.0-emotion-wav2vec2",
         "qg_available": _OLLAMA_AVAILABLE,
+        "emotion_classes": ["angry", "calm", "disgust", "fear", "happy", "neutral", "sad", "surprised"],
         **health_status(),
     }
 
 
-# ── Emotion-only endpoint (unchanged) ─────────────────────────────────────────
+# ── Emotion-only endpoint ─────────────────────────────────────────────────────────
 
 @app.post("/emotion", tags=["emotion"])
 async def emotion_global(file: UploadFile = File(...)):
@@ -110,17 +107,17 @@ async def emotion_global(file: UploadFile = File(...)):
     except Exception as exc:
         return JSONResponse({"error": f"Audio extraction failed: {exc}"}, status_code=422)
 
-    duration  = audio_duration_from_array(audio)
+    duration = audio_duration_from_array(audio)
     t_extract = _ms(t_start)
 
     try:
-        result = await asyncio.to_thread(detect_emotion_global, audio)
+        result = await asyncio.to_thread(detect_emotion_global, audio, config.EMOTION_SR)
     except Exception as exc:
         return JSONResponse({"error": f"Emotion detection failed: {exc}"}, status_code=500)
 
-    result["filename"]    = file.filename
+    result["filename"] = file.filename
     result["duration_sec"] = round(duration, 2)
-    result["extract_ms"]  = t_extract
+    result["extract_ms"] = t_extract
     return result
 
 
@@ -129,12 +126,12 @@ async def emotion_global(file: UploadFile = File(...)):
 @app.post("/transcribe", tags=["transcription"])
 async def transcribe(file: UploadFile = File(...)):
     """
-    Full pipeline: Whisper + Flan-T5 + Emotion ONNX + Qwen QG.
+    Full pipeline: Whisper + Flan-T5 + Wav2Vec2 Emotion + Qwen QG.
 
     Returns:
         whisper      — raw transcript + segments
         correction   — Flan-corrected text + stats
-        emotion      — dominant emotion + confidence
+        emotion      — dominant emotion + confidence (8 classes)
         questions    — 4 jury-style questions from Qwen
         timing       — per-stage latency breakdown
     """
@@ -150,7 +147,7 @@ async def transcribe(file: UploadFile = File(...)):
             {"status": "error", "message": f"Audio extraction failed: {exc}"},
             status_code=422,
         )
-    duration  = audio_duration_from_array(audio)
+    duration = audio_duration_from_array(audio)
     t_extract = _ms(t0)
 
     t1 = time.perf_counter()
@@ -165,7 +162,7 @@ async def transcribe(file: UploadFile = File(...)):
             status_code=500,
         )
     t_pipeline = _ms(t1)
-    t_total    = _ms(t_start)
+    t_total = _ms(t_start)
 
     _print_emotion_terminal(emotion)
     _print_qg_terminal(questions)
@@ -178,39 +175,22 @@ async def transcribe(file: UploadFile = File(...)):
     )
 
     return {
-        "status":       "ok",
-        "filename":     file.filename,
+        "status": "ok",
+        "filename": file.filename,
         "duration_sec": round(duration, 2),
-        "whisper":      whisper_result,
-        "correction":   correction,
-        "emotion":      emotion,
-        "questions":    questions,
+        "whisper": whisper_result,
+        "correction": correction,
+        "emotion": emotion,
+        "questions": questions,
         "timing": {
-            "extract_ms":  t_extract,
+            "extract_ms": t_extract,
             "pipeline_ms": t_pipeline,
-            "total_ms":    t_total,
+            "total_ms": t_total,
         },
     }
 
 
 # ── Live WebSocket — 4-way pipeline (QG skipped in real-time mode) ────────────
-#
-#  QG requires the FULL corrected transcript and takes several seconds on CPU.
-#  In live mode we skip it by default (run_qg=False) to minimise end-to-end
-#  latency.  Set QG_ENABLED_LIVE=true env var to enable it anyway.
-#
-#  Pipeline timeline (live, QG off):
-#    [=====Whisper======]
-#            [=Flan s1=][=s2=]…
-#    [==========Emotion===========]
-#                                  ^ final sent to client
-#
-#  Pipeline timeline (live, QG on):
-#    [=====Whisper======]
-#            [=Flan s1=][=s2=]…
-#    [==========Emotion===========]
-#                                [==Qwen QG==]  ← extra wait
-#                                               ^ final sent to client
 
 import os as _os
 _QG_ENABLED_LIVE = _os.environ.get("QG_ENABLED_LIVE", "false").lower() == "true"
@@ -223,8 +203,8 @@ def _live_pipeline(audio: np.ndarray) -> tuple[dict, dict, dict, dict]:
     """
     t0 = time.perf_counter()
 
-    MAX_SEGS   = 256
-    results    = [None] * MAX_SEGS
+    MAX_SEGS = 256
+    results = [None] * MAX_SEGS
     flan_stats = {"corrected": 0, "kept": 0}
     seg_queue: queue.Queue = queue.Queue(maxsize=4)
 
@@ -235,7 +215,7 @@ def _live_pipeline(audio: np.ndarray) -> tuple[dict, dict, dict, dict]:
     try:
         with ThreadPoolExecutor(max_workers=4) as executor:
             future_whisper = executor.submit(_whisper_producer, audio, seg_queue)
-            future_flan    = executor.submit(_flan_consumer, seg_queue, results, flan_stats)
+            future_flan = executor.submit(_flan_consumer, seg_queue, results, flan_stats)
             future_emotion = executor.submit(_run_emotion, audio)
 
             future_whisper.result()
@@ -243,7 +223,7 @@ def _live_pipeline(audio: np.ndarray) -> tuple[dict, dict, dict, dict]:
 
             # Build corrected text before launching QG
             ordered_partial = [r for r in results if r is not None]
-            corrected_text  = " ".join(c for _, _, c in ordered_partial).strip()
+            corrected_text = " ".join(c for _, _, c in ordered_partial).strip()
 
             future_qg: Future = (
                 executor.submit(_run_qg, corrected_text)
@@ -255,7 +235,7 @@ def _live_pipeline(audio: np.ndarray) -> tuple[dict, dict, dict, dict]:
             )
 
             emotion_data = future_emotion.result()
-            qg_data      = future_qg.result()
+            qg_data = future_qg.result()
 
     finally:
         config.FLAN_ENABLED = original_flan
@@ -269,42 +249,42 @@ def _live_pipeline(audio: np.ndarray) -> tuple[dict, dict, dict, dict]:
         raw_parts.append(raw)
         corrected_parts.append(corrected)
 
-    text           = " ".join(raw_parts).strip()
+    text = " ".join(raw_parts).strip()
     corrected_text = " ".join(corrected_parts).strip()
-    total_segs     = len(segments)
+    total_segs = len(segments)
 
     whisper_result = {
-        "text":       text,
+        "text": text,
         "word_count": len(text.split()) if text else 0,
-        "segments":   segments,
+        "segments": segments,
     }
     correction_result = {
-        "corrected":  corrected_text,
-        "enabled":    config.FLAN_ENABLED_LIVE,
-        "model":      config.FLAN_MODEL if config.FLAN_ENABLED_LIVE else None,
+        "corrected": corrected_text,
+        "enabled": config.FLAN_ENABLED_LIVE,
+        "model": config.FLAN_MODEL if config.FLAN_ENABLED_LIVE else None,
         "latency_ms": t_pipeline,
         "critique_stats": {
             "corrected": flan_stats["corrected"],
-            "kept":      flan_stats["kept"],
-            "total":     total_segs,
+            "kept": flan_stats["kept"],
+            "total": total_segs,
         },
     }
     emotion_result = {
-        "enabled":         emotion_data.get("enabled", config.EMOTION_ENABLED),
-        "emotion":         emotion_data.get("emotion", "unknown"),
-        "confidence":      emotion_data.get("confidence", 0.0),
-        "latency_ms":      emotion_data.get("latency_ms", 0),
-        "is_reliable":     emotion_data.get("is_reliable", False),
-        "all_probs":       emotion_data.get("all_probs", {}),
+        "enabled": emotion_data.get("enabled", config.EMOTION_ENABLED),
+        "emotion": emotion_data.get("emotion", "unknown"),
+        "confidence": emotion_data.get("confidence", 0.0),
+        "latency_ms": emotion_data.get("latency_ms", 0),
+        "is_reliable": emotion_data.get("is_reliable", False),
+        "all_probs": emotion_data.get("all_probs", {}),
         "realtime_factor": emotion_data.get("realtime_factor", 0),
-        "inference_ms":    emotion_data.get("inference_ms", 0),
+        "inference_ms": emotion_data.get("inference_ms", 0),
     }
     questions_result = {
-        "enabled":    qg_data.get("enabled", False),
-        "questions":  qg_data.get("questions", []),
-        "raw":        qg_data.get("raw", ""),
+        "enabled": qg_data.get("enabled", False),
+        "questions": qg_data.get("questions", []),
+        "raw": qg_data.get("raw", ""),
         "latency_ms": qg_data.get("latency_ms", 0),
-        "error":      qg_data.get("error"),
+        "error": qg_data.get("error"),
     }
 
     log.info(
@@ -326,7 +306,7 @@ async def ws_live(ws: WebSocket) -> None:
     """
     Live recording WebSocket endpoint.
 
-    Client protocol (unchanged):
+    Client protocol:
         → raw PCM bytes (int16, mono, 16 kHz) while recording
         → b"__END__" when mic stops
 
@@ -341,9 +321,9 @@ async def ws_live(ws: WebSocket) -> None:
     await ws.accept()
     log.info("Live WebSocket connected")
 
-    MAX_PCM    = 16_000 * 2 * 300
+    MAX_PCM = 16_000 * 2 * 300
     pcm_buffer = bytearray(MAX_PCM)
-    buf_pos    = 0
+    buf_pos = 0
 
     try:
         while True:
@@ -382,19 +362,19 @@ async def ws_live(ws: WebSocket) -> None:
 
                 else:
                     duration_sec = buf_pos / (16_000 * 2)
-                    whisper_r  = {"text": "", "word_count": 0, "segments": []}
+                    whisper_r = {"text": "", "word_count": 0, "segments": []}
                     correction = _empty_correction("")
-                    emotion    = _empty_emotion()
-                    questions  = _empty_questions()
+                    emotion = _empty_emotion()
+                    questions = _empty_questions()
 
                 await _safe_send(ws, {
-                    "type":         "final",
-                    "whisper":      whisper_r,
-                    "correction":   correction,
-                    "emotion":      emotion,
-                    "questions":    questions,
+                    "type": "final",
+                    "whisper": whisper_r,
+                    "correction": correction,
+                    "emotion": emotion,
+                    "questions": questions,
                     "duration_sec": round(duration_sec, 2),
-                    "pipeline_ms":  correction.get("latency_ms", 0),
+                    "pipeline_ms": correction.get("latency_ms", 0),
                 })
                 break
 
@@ -436,9 +416,9 @@ async def _safe_send(ws, msg: dict):
 
 def _empty_correction(text: str) -> dict:
     return {
-        "corrected":  text,
-        "enabled":    False,
-        "model":      None,
+        "corrected": text,
+        "enabled": False,
+        "model": None,
         "latency_ms": 0,
         "critique_stats": {"corrected": 0, "kept": 0, "total": 0},
     }
@@ -446,37 +426,37 @@ def _empty_correction(text: str) -> dict:
 
 def _empty_emotion() -> dict:
     return {
-        "enabled":         False,
-        "emotion":         "unknown",
-        "confidence":      0.0,
-        "latency_ms":      0,
-        "is_reliable":     False,
-        "all_probs":       {},
+        "enabled": False,
+        "emotion": "unknown",
+        "confidence": 0.0,
+        "latency_ms": 0,
+        "is_reliable": False,
+        "all_probs": {},
         "realtime_factor": 0,
-        "inference_ms":    0,
+        "inference_ms": 0,
     }
 
 
 def _empty_questions() -> dict:
     return {
-        "enabled":    False,
-        "questions":  [],
-        "raw":        "",
+        "enabled": False,
+        "questions": [],
+        "raw": "",
         "latency_ms": 0,
-        "error":      "audio too short",
+        "error": "audio too short",
     }
 
 
 def _print_emotion_terminal(emotion: dict) -> None:
     """Print emotion results to terminal with a styled box."""
-    e     = emotion.get("emotion", "unknown").upper()
-    conf  = emotion.get("confidence", 0.0)
-    lat   = emotion.get("latency_ms", 0)
-    rel   = "✓ RELIABLE" if emotion.get("is_reliable") else "⚠ LOW CONFIDENCE"
+    e = emotion.get("emotion", "unknown").upper()
+    conf = emotion.get("confidence", 0.0)
+    lat = emotion.get("latency_ms", 0)
+    rel = "✓ RELIABLE" if emotion.get("is_reliable") else "⚠ LOW CONFIDENCE"
 
     print()
     print("╔" + "═" * 60 + "╗")
-    print("║" + " 🎭  EMOTION DETECTION".center(60) + "║")
+    print("║" + " 🎭  EMOTION DETECTION (Wav2Vec2 - 8 classes)".center(60) + "║")
     print("╠" + "═" * 60 + "╣")
 
     if emotion.get("enabled") is False:
@@ -512,15 +492,15 @@ def _print_qg_terminal(questions: dict) -> None:
         print("╚" + "═" * 60 + "╝")
         return
 
-    lat  = questions.get("latency_ms", 0)
-    qs   = questions.get("questions", [])
+    lat = questions.get("latency_ms", 0)
+    qs = questions.get("questions", [])
 
     print(f"║  Generated {len(qs)} questions  |  Latency: {lat}ms".ljust(61) + "║")
     print("╠" + "─" * 60 + "╣")
     for i, q in enumerate(qs, 1):
         # Word-wrap at 56 chars
-        words  = q.split()
-        lines  = []
+        words = q.split()
+        lines = []
         current = ""
         for w in words:
             if len(current) + len(w) + 1 > 56:
@@ -540,4 +520,4 @@ def _print_qg_terminal(questions: dict) -> None:
             print("║" + " " * 60 + "║")
 
     print("╚" + "═" * 60 + "╝")
-    log.info("🧠 QG: %d questions generated in %dms", len(qs), lat)
+    log.info(" QG: %d questions generated in %dms", len(qs), lat)
