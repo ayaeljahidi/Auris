@@ -1,9 +1,14 @@
-"""Auris — FastAPI application (4-way pipeline: Whisper + Flan + Emotion + QG)"""
+"""Auris — FastAPI application (OPTIMIZED parallel pipeline)
+
+Pipeline: Whisper || Audio Emotion (T=0)
+          → Text Emotion || Flan (when Whisper done)
+          → Fusion || QG (when Phase 2 done)
+"""
 import asyncio
 import logging
 import queue
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future, wait as _wait, ALL_COMPLETED
 from pathlib import Path
 
 import numpy as np
@@ -22,10 +27,11 @@ from .transcribe import (
     _flan_consumer,
     _run_audio_emotion,
     _run_text_emotion,
-    _run_emotion,
     _run_qg,
     _SENTINEL,
     FUSION_AVAILABLE,
+    _correct_batch,
+    _chunk_by_tokens,
 )
 from .emotion import detect_emotion_global
 from .emotion_fusion import fuse_emotions
@@ -44,7 +50,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("auris")
 
-app = FastAPI(title="Auris API", version="18.0-emotion-fusion", docs_url="/api/docs")
+app = FastAPI(title="Auris API", version="18.1-optimized", docs_url="/api/docs")
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,7 +66,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def on_startup() -> None:
     """Pre-load ALL models in background threads."""
-    log.info("Starting Auris v18 — Dual Emotion Fusion (Wav2Vec2 + DistilRoBERTa)")
+    log.info("Starting Auris v18.1 — Optimized Parallel Pipeline")
 
     log.info("Pre-loading Whisper model...")
     await asyncio.to_thread(load_whisper)
@@ -75,13 +81,13 @@ async def on_startup() -> None:
     await asyncio.to_thread(load_text_emotion_model)
 
     if _OLLAMA_AVAILABLE:
-        log.info("Warming up Ollama / Qwen QG model (background)…")
+        log.info("Warming up Ollama / Qwen QG model (background)...")
         asyncio.create_task(asyncio.to_thread(_warmup_ollama))
     else:
         log.warning("⚠ Qwen QG not available — install Ollama + qwen2.5:1.5b")
 
     log.info("✓ All models ready — server starting")
-    log.info("Emotion classes: angry, calm, disgust, fear, happy, neutral, sad, surprised")
+    log.info("Emotion classes: angry, disgust, fear, happy, neutral, sad, surprised")
     log.info("=" * 60)
 
 
@@ -91,7 +97,7 @@ async def on_startup() -> None:
 async def health() -> dict:
     return {
         "status": "ok",
-        "version": "18.0-emotion-fusion",
+        "version": "18.1-optimized",
         "qg_available": _OLLAMA_AVAILABLE,
         "emotion_pipeline": "fusion (wav2vec2 + distilroberta)",
         "audio_emotion_classes": ["angry", "calm", "disgust", "fear", "happy", "neutral", "sad", "surprised"],
@@ -100,7 +106,7 @@ async def health() -> dict:
     }
 
 
-# ── Emotion-only endpoint ─────────────────────────────────────────────────────────
+# ── Emotion-only endpoint ─────────────────────────────────────────────────────
 
 @app.post("/emotion", tags=["emotion"])
 async def emotion_global(file: UploadFile = File(...)):
@@ -128,19 +134,19 @@ async def emotion_global(file: UploadFile = File(...)):
     return result
 
 
-# ── /transcribe — 4-way parallel pipeline ────────────────────────────────────
+# ── /transcribe — OPTIMIZED 5-way parallel pipeline ──────────────────────────
 
 @app.post("/transcribe", tags=["transcription"])
 async def transcribe(file: UploadFile = File(...)):
     """
-    Full pipeline: Whisper + Flan-T5 + Wav2Vec2 Emotion + Qwen QG.
+    Full OPTIMIZED pipeline: Whisper + Flan-T5 + Audio Emotion + Text Emotion + QG.
 
-    Returns:
-        whisper      — raw transcript + segments
-        correction   — Flan-corrected text + stats
-        emotion      — dominant emotion + confidence (8 classes)
-        questions    — 4 jury-style questions from Qwen
-        timing       — per-stage latency breakdown
+    Optimized dependency graph:
+      Phase 1 (T=0):    Whisper ASR  ||  Audio Emotion (Wav2Vec2)
+      Phase 2 (Whisper done): Text Emotion (raw) || Flan Correction
+      Phase 3 (Phase 2 done): Emotion Fusion || Qwen QG
+
+    Text Emotion runs on RAW text, not corrected — saves Flan latency.
     """
     t_start = time.perf_counter()
     raw_bytes = await file.read()
@@ -205,97 +211,145 @@ _QG_ENABLED_LIVE = _os.environ.get("QG_ENABLED_LIVE", "true").lower() == "true"
 
 
 def _live_pipeline(audio: np.ndarray) -> tuple[dict, dict, dict, dict]:
-    """5-way pipeline for the WebSocket live endpoint."""
+    """
+    OPTIMIZED 5-way pipeline for the WebSocket live endpoint.
+
+    Same optimized dependency graph as /transcribe:
+      Phase 1: Whisper || Audio Emotion
+      Phase 2: Text Emotion (raw) || Flan
+      Phase 3: Fusion || QG
+    """
     t0 = time.perf_counter()
 
     MAX_SEGS = 256
     results = [None] * MAX_SEGS
     flan_stats = {"corrected": 0, "kept": 0}
-    seg_queue: queue.Queue = queue.Queue(maxsize=4)
+    seg_queue: queue.Queue = queue.Queue(maxsize=0)
 
-    original_flan = config.FLAN_ENABLED
-    config.FLAN_ENABLED = config.FLAN_ENABLED_LIVE
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # ── PHASE 1: Whisper + Audio Emotion (parallel) ──────────────────
+        future_audio_emotion = executor.submit(_run_audio_emotion, audio)
+        future_whisper = executor.submit(_whisper_producer, audio, seg_queue)
 
-    try:
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_whisper       = executor.submit(_whisper_producer, audio, seg_queue)
-            future_flan          = executor.submit(_flan_consumer, seg_queue, results, flan_stats)
-            future_audio_emotion = executor.submit(_run_audio_emotion, audio)
+        # Wait for Whisper
+        future_whisper.result()
+        t_whisper_ms = round((time.perf_counter() - t0) * 1000)
 
-            future_whisper.result()
-            future_flan.result()
+        # Drain queue to get raw_text
+        queue_items: list = []
+        raw_parts: list[str] = []
+        segments: list[dict] = []
+        while True:
+            item = seg_queue.get()
+            if item is _SENTINEL:
+                break
+            queue_items.append(item)
+            idx, seg_dict, raw_text, needs_corr = item
+            results[idx] = (seg_dict, raw_text, raw_text)
+            raw_parts.append(raw_text)
+            segments.append(seg_dict)
 
-            ordered_partial = [r for r in results if r is not None]
-            corrected_text  = " ".join(c for _, _, c in ordered_partial).strip()
+        raw_text = " ".join(raw_parts).strip()
+        total_segs = len(segments)
 
-            future_text_emotion = executor.submit(_run_text_emotion, corrected_text)
-            future_qg: Future = (
-                executor.submit(_run_qg, corrected_text)
-                if _QG_ENABLED_LIVE
-                else executor.submit(lambda: {
-                    "enabled": False, "questions": [], "raw": "",
-                    "latency_ms": 0, "error": "skipped (live mode)",
-                })
-            )
+        # ── PHASE 2: Text Emotion (raw) + Flan (parallel) ──────────────────
+        t_phase2 = time.perf_counter()
 
-            audio_emotion_data = future_audio_emotion.result()
-            text_emotion_data  = future_text_emotion.result()
-            qg_data            = future_qg.result()
+        future_text_emotion = executor.submit(_run_text_emotion, raw_text)
 
-    finally:
-        config.FLAN_ENABLED = original_flan
+        # Flan correction (in-thread, queue already drained)
+        if config.FLAN_ENABLED:
+            model, tokenizer = load_flan()
+            if model is not None and tokenizer is not None:
+                device = next(model.parameters()).device
+
+                needs: list = []
+                keeps: list = []
+                for idx, seg_dict, raw_text, needs_correction in queue_items:
+                    if needs_correction:
+                        needs.append((idx, seg_dict, raw_text))
+                    else:
+                        keeps.append((idx, seg_dict, raw_text))
+                        flan_stats["kept"] += 1
+
+                if needs:
+                    raw_texts = [raw for _, _, raw in needs]
+                    corrected_s = _correct_batch(raw_texts, model, tokenizer, device)
+                    for (idx, seg_dict, raw_text), corrected in zip(needs, corrected_s):
+                        changed = corrected != raw_text.strip()
+                        flan_stats["corrected"] += int(changed)
+                        flan_stats["kept"] += int(not changed)
+                        results[idx] = (seg_dict, raw_text, corrected)
+
+                for idx, seg_dict, raw_text in keeps:
+                    results[idx] = (seg_dict, raw_text, raw_text.strip())
+
+        t_flan_ms = round((time.perf_counter() - t_phase2) * 1000)
+
+        # Build corrected_text
+        ordered = [r for r in results if r is not None]
+        corrected_parts = [corrected for _, _, corrected in ordered]
+        corrected_text = " ".join(corrected_parts).strip()
+
+        # ── PHASE 3: Fusion + QG (parallel) ──────────────────────────────
+        t_phase3 = time.perf_counter()
+
+        _wait([future_audio_emotion, future_text_emotion], return_when=ALL_COMPLETED)
+        audio_emotion_data = future_audio_emotion.result()
+        text_emotion_data = future_text_emotion.result()
+
+        # Fusion (fast, in-thread)
+        if FUSION_AVAILABLE:
+            fused_emotion = fuse_emotions(audio_emotion_data, text_emotion_data)
+        else:
+            fused_emotion = {
+                **audio_emotion_data,
+                "source": "audio_only",
+                "fusion_weights": {"audio": 1.0, "text": 0.0},
+                "audio_emotion": audio_emotion_data,
+                "text_emotion": text_emotion_data,
+            }
+
+        # QG (in thread, async HTTP inside)
+        future_qg: Future = (
+            executor.submit(_run_qg, corrected_text)
+            if _QG_ENABLED_LIVE
+            else executor.submit(lambda: {
+                "enabled": False, "questions": [], "raw": "",
+                "latency_ms": 0, "error": "skipped (live mode)",
+            })
+        )
+        qg_data = future_qg.result()
 
     t_pipeline = round((time.perf_counter() - t0) * 1000)
 
-    # Fuse emotion signals
-    if FUSION_AVAILABLE:
-        fused_emotion = fuse_emotions(audio_emotion_data, text_emotion_data)
-    else:
-        fused_emotion = {
-            **audio_emotion_data,
-            "source": "audio_only",
-            "fusion_weights": {"audio": 1.0, "text": 0.0},
-            "audio_emotion": audio_emotion_data,
-            "text_emotion":  text_emotion_data,
-        }
-
-    ordered = [r for r in results if r is not None]
-    segments, raw_parts, corrected_parts = [], [], []
-    for seg_dict, raw, corrected in ordered:
-        segments.append(seg_dict)
-        raw_parts.append(raw)
-        corrected_parts.append(corrected)
-
-    text           = " ".join(raw_parts).strip()
-    corrected_text = " ".join(corrected_parts).strip()
-    total_segs     = len(segments)
-
+    # Build results
     whisper_result = {
-        "text": text,
-        "word_count": len(text.split()) if text else 0,
+        "text": raw_text,
+        "word_count": len(raw_text.split()) if raw_text else 0,
         "segments": segments,
     }
     correction_result = {
-        "corrected":  corrected_text,
-        "enabled":    config.FLAN_ENABLED_LIVE,
-        "model":      config.FLAN_MODEL if config.FLAN_ENABLED_LIVE else None,
+        "corrected": corrected_text,
+        "enabled": config.FLAN_ENABLED_LIVE,
+        "model": config.FLAN_MODEL if config.FLAN_ENABLED_LIVE else None,
         "latency_ms": t_pipeline,
         "critique_stats": {
             "corrected": flan_stats["corrected"],
-            "kept":      flan_stats["kept"],
-            "total":     total_segs,
+            "kept": flan_stats["kept"],
+            "total": total_segs,
         },
     }
     questions_result = {
-        "enabled":    qg_data.get("enabled", False),
-        "questions":  qg_data.get("questions", []),
-        "raw":        qg_data.get("raw", ""),
+        "enabled": qg_data.get("enabled", False),
+        "questions": qg_data.get("questions", []),
+        "raw": qg_data.get("raw", ""),
         "latency_ms": qg_data.get("latency_ms", 0),
-        "error":      qg_data.get("error"),
+        "error": qg_data.get("error"),
     }
 
     log.info(
-        "✅ Live pipeline — whisper:%d seg | flan(live):%s +%d/=%d | "
+        "Live pipeline (OPTIMIZED) — whisper:%d seg | flan(live):%s +%d/=%d | "
         "audio_emotion:%s(%.1f%%) | text_emotion:%s(%.1f%%) | "
         "fused:%s(%.1f%%) | qg:%s | total:%dms",
         total_segs,
@@ -314,26 +368,21 @@ def _live_pipeline(audio: np.ndarray) -> tuple[dict, dict, dict, dict]:
     return whisper_result, correction_result, fused_emotion, questions_result
 
 
-# ── FIX: accumulate webm blobs then decode with PyAV ──────────────────────────
-# The browser MediaRecorder produces audio/webm (Opus codec). The original
-# code tried to interpret these compressed bytes as raw int16 PCM, which
-# produced garbage.  Now we buffer the webm chunks, reassemble the container,
-# and decode with extract_audio_to_numpy() — the same path used by /transcribe.
+# ── WebSocket endpoint ─────────────────────────────────────────────────────────
 
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket) -> None:
     """
     Live recording WebSocket endpoint.
-
     Client sends audio/webm chunks from MediaRecorder, then b"__END__".
-    Server decodes the webm container and runs the full pipeline.
+    Server decodes the webm container and runs the OPTIMIZED pipeline.
     """
     await ws.accept()
     log.info("Live WebSocket connected")
 
     webm_chunks: list[bytes] = []
     total_bytes = 0
-    MAX_BYTES = 300 * 1024 * 1024  # 300 MB ≈ 5 min of webm
+    MAX_BYTES = 300 * 1024 * 1024  # 300 MB
 
     try:
         while True:
@@ -349,7 +398,7 @@ async def ws_live(ws: WebSocket) -> None:
                 return
 
             if data == b"__END__":
-                await _safe_send(ws, {"type": "status", "msg": "Running pipeline…"})
+                await _safe_send(ws, {"type": "status", "msg": "Running pipeline..."})
 
                 if total_bytes < 1024:
                     await _safe_send(ws, {
@@ -417,7 +466,7 @@ async def ws_live(ws: WebSocket) -> None:
 
             webm_chunks.append(data)
             total_bytes += len(data)
-            await _safe_send(ws, {"type": "partial", "text": "Recording… speak now"})
+            await _safe_send(ws, {"type": "partial", "text": "Recording... speak now"})
 
     except WebSocketDisconnect:
         log.info("Live WebSocket disconnected")
@@ -426,7 +475,7 @@ async def ws_live(ws: WebSocket) -> None:
         await _safe_send(ws, {"type": "error", "msg": str(exc)})
 
 
-# ── Static frontend (served from frontend/dist after `npm run build`) ──────────
+# ── Static frontend ────────────────────────────────────────────────────────────
 
 _frontend = Path(__file__).parent.parent / "frontend" / "dist"
 if _frontend.exists():

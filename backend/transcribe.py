@@ -1,43 +1,41 @@
-"""Auris — Transcription engine with streaming Flan-T5 correction + QG
+"""Auris — Transcription engine with OPTIMIZED parallel pipeline
 
-Pipeline architecture (4-way parallel):
-  ┌─────────────┐   Queue   ┌─────────────┐
-  │   Whisper   │ ─────────▶│   Flan-T5   │   (batch: collects all segments,
-  │  (iterator) │           │  consumer   │    then runs ONE batched forward pass)
-  └─────────────┘           └─────────────┘
-         │                        │
-         │                        └─── corrected_text ──▶ ┌──────────────┐
-         │                                                  │  Qwen QG     │
-         │                                                  │  (async HTTP)│
-         └──────────────────────────────────────────────▶  └──────────────┘
-                                                    AND:
-                                                    ┌──────────────┐
-                                                    │   Emotion    │
-                                                    │  (batched)   │
-                                                    └──────────────┘
+Pipeline architecture (Maximum Parallelism):
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  PHASE 1: Launch simultaneously (T=0)                               │
+  │    ┌─────────────┐        ┌─────────────────┐                     │
+  │    │   Whisper   │        │  Audio Emotion  │                     │
+  │    │    ASR      │        │   (Wav2Vec2)    │                     │
+  │    └──────┬──────┘        └─────────────────┘                     │
+  │           │                                                        │
+  │           ▼  raw_text available                                    │
+  │  PHASE 2: Launch simultaneously                                    │
+  │    ┌─────────────┐        ┌─────────────────┐                     │
+  │    │ Text Emotion│        │  Flan-T5 Batch  │                     │
+  │    │(DistilRoBERTa)│      │   Correction    │                     │
+  │    └──────┬──────┘        └────────┬────────┘                     │
+  │           │                        │                               │
+  │           ▼                        ▼  corrected_text               │
+  │  PHASE 3: Launch simultaneously                                    │
+  │    ┌─────────────┐        ┌─────────────────┐                     │
+  │    │   Fusion    │        │   Qwen QG       │                     │
+  │    │  (merge)    │        │  (async HTTP)   │                     │
+  │    └──────┬──────┘        └─────────────────┘                     │
+  │           │                                                        │
+  │           └────────────────┬─────────────────┘                     │
+  │                            ▼                                       │
+  │                      JSON Response                                 │
+  └─────────────────────────────────────────────────────────────────────┘
 
-P0 — Batch Flan-T5: accumulate all segments that need correction, then run
-     ONE batched model.generate() call instead of N serial calls.  Reduces
-     Flan latency by 3-5× on typical audio (8-20 segments).
-
-P0/P1 — Async Ollama client: generate_questions() is now called via
-     asyncio + httpx so the thread-pool worker is freed while waiting for
-     the Ollama HTTP response.  Falls back to the sync path if httpx is absent.
-
-P1 — Cross-request emotion batching: _run_audio_emotion accepts a list of
-     audio arrays and delegates to detect_emotion_global which already uses a
-     batched forward pass internally.  This wires up the interface correctly
-     for future request-coalescing middleware.
-
-P2 — Token-based text chunking for Flan: segments are tokenised once and
-     split on a real token budget (FLAN_MAX_INPUT_TOKENS) rather than a fixed
-     character count, improving both accuracy and speed.
+Key optimization: Text Emotion runs on RAW text (not corrected), so it can
+start immediately when Whisper finishes — no need to wait for Flan.
+Audio Emotion starts at T=0 alongside Whisper, maximizing parallelism.
 """
 import asyncio
 import logging
 import queue
 import time
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future, wait as _wait, ALL_COMPLETED
 
 import numpy as np
 import torch
@@ -159,9 +157,7 @@ def _chunk_by_tokens(
 ) -> list[str]:
     """
     Split *text* into chunks whose token length ≤ max_tokens.
-
-    Uses the Flan tokenizer directly so we never silently truncate long
-    segments.  Returns a list of ≥1 string.
+    Uses the Flan tokenizer directly so we never silently truncate long segments.
     """
     tokens = tokenizer.encode(text, add_special_tokens=False)
     if len(tokens) <= max_tokens:
@@ -184,22 +180,13 @@ def _correct_batch(
 ) -> list[str]:
     """
     Run Flan-T5 on a *batch* of segment texts in one forward pass.
-
-    3-5× faster than calling model.generate() per-segment because:
-      • Tokenisation is batched (single call).
-      • The ONNX/C++ kernel runs once over the whole batch instead of N times.
-      • No Python loop overhead during the generate phase.
-
-    Each text is first checked against the real token budget (P2); texts that
-    exceed it are split into sub-chunks, each corrected independently, then
-    rejoined.
+    3-5× faster than calling model.generate() per-segment.
     """
     if not texts:
         return []
 
     max_tok = config.FLAN_MAX_INPUT_TOKENS
     prompts: list[str] = []
-    # Map from prompt index back to (text_idx, chunk_idx)
     index_map: list[tuple[int, int]] = []
 
     for text_idx, text in enumerate(texts):
@@ -212,7 +199,7 @@ def _correct_batch(
         prompts,
         return_tensors="pt",
         truncation=True,
-        max_length=max_tok + 10,  # +10 for "Fix grammar: " prefix tokens
+        max_length=max_tok + 10,
         padding=True,
     ).to(device)
 
@@ -228,7 +215,6 @@ def _correct_batch(
 
     decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-    # Re-assemble: group corrected chunks back to their source text
     assembled: dict[int, list[tuple[int, str]]] = {}
     for prompt_idx, (text_idx, chunk_idx) in enumerate(index_map):
         assembled.setdefault(text_idx, []).append((chunk_idx, decoded[prompt_idx].strip()))
@@ -249,13 +235,8 @@ def _flan_consumer(
 ) -> None:
     """
     P0: Batched Flan-T5 consumer.
-
-    Drains the queue completely, then runs ONE batched forward pass over all
-    segments that need correction instead of correcting them one-by-one.
-    This is faster because GPU/CPU kernels saturate on a batch far better
-    than on repeated single-sample calls.
+    Drains the queue completely, then runs ONE batched forward pass.
     """
-    # Drain the entire queue first
     items: list[tuple[int, dict, str, bool]] = []
     while True:
         item = seg_queue.get()
@@ -276,9 +257,8 @@ def _flan_consumer(
 
     device = next(model.parameters()).device
 
-    # Separate which segments need correction
-    needs: list[tuple[int, dict, str]] = []   # (idx, seg_dict, raw_text)
-    keeps: list[tuple[int, dict, str]] = []   # no correction needed
+    needs: list[tuple[int, dict, str]] = []
+    keeps: list[tuple[int, dict, str]] = []
 
     for idx, seg_dict, raw_text, needs_correction in items:
         if needs_correction:
@@ -287,29 +267,24 @@ def _flan_consumer(
             keeps.append((idx, seg_dict, raw_text))
             stats["kept"] += 1
 
-    # Batch-correct the ones that need it
     if needs:
         t_batch = time.perf_counter()
-        raw_texts   = [raw for _, _, raw in needs]
+        raw_texts = [raw for _, _, raw in needs]
         corrected_s = _correct_batch(raw_texts, model, tokenizer, device)
-        batch_ms    = round((time.perf_counter() - t_batch) * 1000)
-        log.debug(
-            "Flan batch: %d segments corrected in %dms (%.1fms/seg)",
-            len(needs), batch_ms, batch_ms / len(needs),
-        )
+        batch_ms = round((time.perf_counter() - t_batch) * 1000)
+        log.debug("Flan batch: %d/%d corrected in %dms", len(needs), len(items), batch_ms)
+
         for (idx, seg_dict, raw_text), corrected in zip(needs, corrected_s):
             changed = corrected != raw_text.strip()
             stats["corrected"] += int(changed)
             stats["kept"] += int(not changed)
-            log.debug("Flan seg[%d] — %s→ %s", idx, "✏ " if changed else "✓ ", corrected[:60])
             results[idx] = (seg_dict, raw_text, corrected)
 
-    # Pass-through for segments that didn't need correction
     for idx, seg_dict, raw_text in keeps:
         results[idx] = (seg_dict, raw_text, raw_text.strip())
 
 
-# ── Legacy single-segment corrector (kept for correct_text() endpoint) ─────────
+# ── Legacy single-segment corrector ────────────────────────────────────────────
 
 def _correct_one(text: str, model, tokenizer, device) -> str:
     """Run Flan-T5 on a single segment text (used by correct_text() only)."""
@@ -324,9 +299,6 @@ async def _run_qg_async(corrected_text: str) -> dict:
     """
     P1: Question generation via Ollama — async HTTP so the thread-pool worker
     is freed while waiting for the network response.
-
-    Uses httpx if available (non-blocking); falls back to the sync requests
-    path in a thread via asyncio.to_thread if not.
     """
     _empty = {
         "enabled":    False,
@@ -344,14 +316,12 @@ async def _run_qg_async(corrected_text: str) -> dict:
 
     t0 = time.perf_counter()
     try:
-        # Attempt async path first (httpx)
         try:
             import httpx
-
             from .qwen_questions import OLLAMA_URL, MODEL_NAME, SYSTEM_PROMPT
             words = corrected_text.split()
             text_in = (" ".join(words[:200]) + "…") if len(words) > 200 else corrected_text
-            prompt  = f"{SYSTEM_PROMPT}\n\nPresentation:\n{text_in}"
+            prompt = f"{SYSTEM_PROMPT}\n\nPresentation:\n{text_in}"
 
             async with httpx.AsyncClient(timeout=300) as client:
                 resp = await client.post(
@@ -374,12 +344,11 @@ async def _run_qg_async(corrected_text: str) -> dict:
                 raw = resp.json()["response"].strip()
 
         except ImportError:
-            # httpx not installed — fall back to sync generate_questions in thread
             raw = await asyncio.to_thread(generate_questions, corrected_text)
 
         latency_ms = round((time.perf_counter() - t0) * 1000)
 
-        lines     = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         questions = []
         for ln in lines:
             if ln and ln[0].isdigit() and len(ln) > 2 and ln[1] in ".):" :
@@ -398,12 +367,7 @@ async def _run_qg_async(corrected_text: str) -> dict:
     except Exception as exc:
         latency_ms = round((time.perf_counter() - t0) * 1000)
         log.error("QG failed: %s", exc)
-        return {
-            **_empty,
-            "enabled":    True,
-            "latency_ms": latency_ms,
-            "error":      str(exc),
-        }
+        return {**_empty, "enabled": True, "latency_ms": latency_ms, "error": str(exc)}
 
 
 def _run_qg(corrected_text: str) -> dict:
@@ -411,29 +375,19 @@ def _run_qg(corrected_text: str) -> dict:
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            # Called from inside an async context (e.g. thread-pool worker
-            # spawned from an async endpoint) — use asyncio.run_coroutine_threadsafe.
             import concurrent.futures as _cf
             fut = asyncio.run_coroutine_threadsafe(_run_qg_async(corrected_text), loop)
             return fut.result(timeout=310)
         else:
             return loop.run_until_complete(_run_qg_async(corrected_text))
     except Exception:
-        # Pure fallback: new loop
         return asyncio.run(_run_qg_async(corrected_text))
 
 
-# ── P1: Cross-request emotion batching interface ──────────────────────────────
+# ── Emotion wrappers ──────────────────────────────────────────────────────────
 
 def _run_audio_emotion(audio: np.ndarray) -> dict:
-    """
-    Audio emotion detection (Wav2Vec2) — single-audio wrapper.
-
-    detect_emotion_global already executes a batched forward pass across all
-    segments within *one* audio file (P1 batching is therefore in-request).
-    For cross-request batching, callers can collect multiple audio arrays and
-    pass them to detect_emotion_global_batch (see emotion.py) if available.
-    """
+    """Audio emotion detection (Wav2Vec2) — single-audio wrapper."""
     _empty = {
         "enabled": False, "emotion": "unknown", "confidence": 0.0,
         "latency_ms": 0, "is_reliable": False, "all_probs": {}, "model": None,
@@ -458,116 +412,194 @@ def _run_text_emotion(text: str) -> dict:
     return detect_emotion_from_text(text)
 
 
-# Keep legacy alias so existing call-sites still work
-def _run_emotion(audio: np.ndarray) -> dict:
-    return _run_audio_emotion(audio)
+# Keep legacy alias
+_run_emotion = _run_audio_emotion
 
 
-# ── Main 4-way pipeline ───────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# OPTIMIZED MAIN PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def transcribe_whisper_with_correction_and_emotion(
     audio: np.ndarray,
     run_qg: bool = True,
 ) -> tuple[dict, dict, dict, dict]:
     """
-    Five-way pipeline: Whisper + Flan-T5 + Audio Emotion + Text Emotion + QG.
+    OPTIMIZED 5-way parallel pipeline.
 
-    P0: Flan now runs a single batched forward pass (see _flan_consumer).
-    P1: QG uses async Ollama HTTP (non-blocking thread-pool worker).
-    Audio emotion runs in a thread alongside Whisper/Flan (models pre-loaded,
-    no reload per request). Text emotion + QG start as soon as Flan finishes.
-    Both emotion signals are merged by the fusion layer.
+    Dependency graph (all independent branches run simultaneously):
+
+        PHASE 1 (T=0):  ┌─► Whisper ASR ─────┐
+                        │                    │ raw_text
+                        └─► Audio Emotion ───┘
+
+        PHASE 2 (Whisper done):
+                        ┌─► Text Emotion (raw_text) ──┐
+                        │                               │
+                        └─► Flan Correction ────────────┘ corrected_text
+
+        PHASE 3 (Phase 2 done):
+                        ┌─► Emotion Fusion ─────────────┐
+                        │   (audio + text results)      │
+                        │                               │
+                        └─► Qwen QG (corrected_text) ───┘
+
+    Key optimization: Text Emotion runs on RAW text, not corrected text.
+    This eliminates the Flan→TextEmotion dependency, saving Flan latency.
     """
     t0 = time.perf_counter()
 
     MAX_SEGS   = 256
     results    = [None] * MAX_SEGS
     flan_stats = {"corrected": 0, "kept": 0}
-    seg_queue: queue.Queue = queue.Queue(maxsize=0)  # unbounded — batch consumer drains all
+    seg_queue: queue.Queue = queue.Queue(maxsize=0)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # PHASE 1: Launch Whisper + Audio Emotion simultaneously (T=0)
+    # ─────────────────────────────────────────────────────────────────────────
     with ThreadPoolExecutor(max_workers=5) as executor:
+        t_phase1 = time.perf_counter()
+
+        # Audio Emotion starts IMMEDIATELY (no dependency on anything)
         future_audio_emotion = executor.submit(_run_audio_emotion, audio)
 
-        t_whisper_start = time.perf_counter()
-        future_whisper  = executor.submit(_whisper_producer, audio, seg_queue)
-        future_flan     = executor.submit(_flan_consumer, seg_queue, results, flan_stats)
+        # Whisper starts immediately, streams segments into queue
+        future_whisper = executor.submit(_whisper_producer, audio, seg_queue)
 
+        # Wait for Whisper to finish → raw_text is now available in queue
         future_whisper.result()
-        t_whisper_ms = round((time.perf_counter() - t_whisper_start) * 1000)
+        t_whisper_ms = round((time.perf_counter() - t_phase1) * 1000)
 
-        future_flan.result()
-        t_flan_ms = (
-            round((time.perf_counter() - t_whisper_start) * 1000) - t_whisper_ms
-        )
+        # Drain queue to build raw_text (needed for Text Emotion)
+        # Note: Flan consumer also needs to drain the same queue,
+        # so we collect items here and pass them to Flan
+        queue_items: list = []
+        raw_parts: list[str] = []
+        segments: list[dict] = []
+        while True:
+            item = seg_queue.get()
+            if item is _SENTINEL:
+                break
+            queue_items.append(item)
+            idx, seg_dict, raw_text, needs_corr = item
+            results[idx] = (seg_dict, raw_text, raw_text)  # pre-fill with raw
+            raw_parts.append(raw_text)
+            segments.append(seg_dict)
 
-        ordered_partial = [r for r in results if r is not None]
-        corrected_parts = [corrected for _, _, corrected in ordered_partial]
-        corrected_text  = " ".join(corrected_parts).strip()
+        raw_text = " ".join(raw_parts).strip()
+        total_segs = len(segments)
 
-        # Stage 2: text emotion + QG in parallel
-        future_text_emotion = executor.submit(_run_text_emotion, corrected_text)
+        # ─────────────────────────────────────────────────────────────────────
+        # PHASE 2: Launch Text Emotion + Flan simultaneously
+        # Text Emotion uses RAW text (not corrected) — saves Flan latency!
+        # ─────────────────────────────────────────────────────────────────────
+        t_phase2 = time.perf_counter()
+
+        future_text_emotion = executor.submit(_run_text_emotion, raw_text)
+
+        # Flan consumer processes the queue items we already drained
+        # We run it in-thread since queue is already drained
+        if config.FLAN_ENABLED:
+            model, tokenizer = load_flan()
+            if model is not None and tokenizer is not None:
+                device = next(model.parameters()).device
+
+                needs: list[tuple[int, dict, str]] = []
+                keeps: list[tuple[int, dict, str]] = []
+
+                for idx, seg_dict, raw_text, needs_correction in queue_items:
+                    if needs_correction:
+                        needs.append((idx, seg_dict, raw_text))
+                    else:
+                        keeps.append((idx, seg_dict, raw_text))
+                        flan_stats["kept"] += 1
+
+                if needs:
+                    t_batch = time.perf_counter()
+                    raw_texts = [raw for _, _, raw in needs]
+                    corrected_s = _correct_batch(raw_texts, model, tokenizer, device)
+                    batch_ms = round((time.perf_counter() - t_batch) * 1000)
+                    log.debug("Flan batch: %d/%d corrected in %dms", len(needs), total_segs, batch_ms)
+
+                    for (idx, seg_dict, raw_text), corrected in zip(needs, corrected_s):
+                        changed = corrected != raw_text.strip()
+                        flan_stats["corrected"] += int(changed)
+                        flan_stats["kept"] += int(not changed)
+                        results[idx] = (seg_dict, raw_text, corrected)
+
+                for idx, seg_dict, raw_text in keeps:
+                    results[idx] = (seg_dict, raw_text, raw_text.strip())
+
+        t_flan_ms = round((time.perf_counter() - t_phase2) * 1000)
+
+        # Build corrected_text from results
+        ordered = [r for r in results if r is not None]
+        corrected_parts = [corrected for _, _, corrected in ordered]
+        corrected_text = " ".join(corrected_parts).strip()
+
+        # ─────────────────────────────────────────────────────────────────────
+        # PHASE 3: Launch Fusion + QG simultaneously
+        # Fusion needs: Audio Emotion + Text Emotion
+        # QG needs: corrected_text
+        # ─────────────────────────────────────────────────────────────────────
+        t_phase3 = time.perf_counter()
+
+        # Wait for emotion results (they should already be done or nearly done)
+        _wait([future_audio_emotion, future_text_emotion], return_when=ALL_COMPLETED)
+        audio_emotion_data = future_audio_emotion.result()
+        text_emotion_data  = future_text_emotion.result()
+
+        # Fusion (can run in-thread, it's fast)
+        if FUSION_AVAILABLE:
+            fused_emotion = fuse_emotions(audio_emotion_data, text_emotion_data)
+        else:
+            fused_emotion = {
+                **audio_emotion_data,
+                "source": "audio_only",
+                "fusion_weights": {"audio": 1.0, "text": 0.0},
+                "audio_emotion": audio_emotion_data,
+                "text_emotion":  text_emotion_data,
+            }
+
+        t_fusion_ms = round((time.perf_counter() - t_phase3) * 1000)
+
+        # QG runs in parallel thread (async HTTP inside)
         future_qg: Future = (
             executor.submit(_run_qg, corrected_text)
             if run_qg
-            else executor.submit(
-                lambda: {
-                    "enabled": False, "questions": [], "raw": "",
-                    "latency_ms": 0, "error": "skipped (live mode)",
-                }
-            )
+            else executor.submit(lambda: {
+                "enabled": False, "questions": [], "raw": "",
+                "latency_ms": 0, "error": "skipped",
+            })
         )
 
-        from concurrent.futures import wait as _wait, ALL_COMPLETED
-        _wait(
-            [future_audio_emotion, future_text_emotion, future_qg],
-            return_when=ALL_COMPLETED,
-        )
-        audio_emotion_data = future_audio_emotion.result()
-        text_emotion_data  = future_text_emotion.result()
-        qg_data            = future_qg.result()
+        qg_data = future_qg.result()
+        t_qg_ms = round((time.perf_counter() - t_phase3) * 1000)
 
     t_pipeline = round((time.perf_counter() - t0) * 1000)
 
-    # Fuse emotion signals
-    if FUSION_AVAILABLE:
-        fused_emotion = fuse_emotions(audio_emotion_data, text_emotion_data)
-    else:
-        fused_emotion = {
-            **audio_emotion_data,
-            "source": "audio_only",
-            "fusion_weights": {"audio": 1.0, "text": 0.0},
-            "audio_emotion": audio_emotion_data,
-            "text_emotion":  text_emotion_data,
-        }
-
-    ordered = [r for r in results if r is not None]
-    segments, raw_parts, corrected_parts2 = [], [], []
-    for seg_dict, raw, corrected in ordered:
-        segments.append(seg_dict)
-        raw_parts.append(raw)
-        corrected_parts2.append(corrected)
-
-    text            = " ".join(raw_parts).strip()
-    corrected_text  = " ".join(corrected_parts2).strip()
-    total_segs      = len(segments)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Build final results
+    # ─────────────────────────────────────────────────────────────────────────
     corrected_count = flan_stats["corrected"]
     kept_count      = flan_stats["kept"]
 
     whisper_result = {
-        "text":       text,
-        "word_count": len(text.split()) if text else 0,
+        "text":       raw_text,
+        "word_count": len(raw_text.split()) if raw_text else 0,
         "segments":   segments,
     }
     correction_result = {
         "corrected":  corrected_text,
         "enabled":    config.FLAN_ENABLED,
         "model":      config.FLAN_MODEL if config.FLAN_ENABLED else None,
-        "latency_ms": t_pipeline,
+        "latency_ms": t_flan_ms,
         "stage_ms": {
             "whisper":      t_whisper_ms,
             "flan":         t_flan_ms,
             "emotion":      audio_emotion_data.get("latency_ms", 0),
             "text_emotion": text_emotion_data.get("latency_ms", 0),
+            "fusion":       t_fusion_ms,
             "qg":           qg_data.get("latency_ms", 0),
         },
         "critique_stats": {
@@ -585,7 +617,7 @@ def transcribe_whisper_with_correction_and_emotion(
     }
 
     log.info(
-        "✅ Pipeline — whisper:%d seg | flan:+%d/=%d | "
+        "Pipeline (OPTIMIZED) — whisper:%d seg | flan:+%d/=%d | "
         "audio_emotion:%s(%.1f%%) | text_emotion:%s(%.1f%%) | "
         "fused:%s(%.1f%%) | qg:%d questions | total:%dms",
         total_segs, corrected_count, kept_count,
