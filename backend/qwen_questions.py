@@ -8,21 +8,13 @@ import requests
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL_NAME = "qwen2.5:1.5b"
-SYSTEM_PROMPT = """You are an expert jury member evaluating a technical student presentation.
-Generate exactly 4 jury-style questions based on the transcribed content.
-
-STRICT RULES:
-- Each question must be ONE question only — do not combine multiple questions into one
-- The question can be detailed and long but must have only ONE question mark at the end
-- Do not use "and what", "also explain", "additionally" to chain multiple questions together
-- Do NOT generate generic questions that could apply to any presentation
-- Output ONLY the 4 numbered questions, nothing else
-
+SYSTEM_PROMPT = """You are a jury member evaluating a student presentation.
+Output ONLY 4 numbered questions. Each must be specific to the content below, one question mark only.
 Format:
-1. [one detailed question]
-2. [one detailed question]
-3. [one detailed question]
-4. [one detailed question]"""
+1. [question]
+2. [question]
+3. [question]
+4. [question]"""
 
 
 
@@ -56,7 +48,12 @@ def _load_model() -> None:
           
  
 def generate_questions(transcribed_text: str) -> str:
-    prompt = f"{SYSTEM_PROMPT}\n\nHere is the transcribed presentation:\n\n{transcribed_text}"
+    # Trim to 200 words — enough context for 4 specific questions
+    words = transcribed_text.split()
+    if len(words) > 200:
+        transcribed_text = " ".join(words[:200]) + "…"
+
+    prompt = f"{SYSTEM_PROMPT}\n\nPresentation:\n{transcribed_text}"
 
     response = requests.post(
         OLLAMA_URL,
@@ -64,14 +61,14 @@ def generate_questions(transcribed_text: str) -> str:
             "model": MODEL_NAME,
             "prompt": prompt,
             "stream": False,
-             "keep_alive": -1, 
-           "options": {
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "repeat_penalty": 1.1,
-            "num_predict": 250,   # ← reduced from 400, notes were eating most of those tokens
-            "num_ctx": 4096, 
-        }
+            "keep_alive": -1,
+            "options": {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "repeat_penalty": 1.1,
+                "num_predict": 180,
+                "num_ctx": 512,   # minimal — prompt fits in ~350 tokens
+            }
         },
         timeout=300,
     )

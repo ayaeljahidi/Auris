@@ -1,10 +1,21 @@
-"""Vosper — Audio utility functions (zero-copy, PyAV-optimized)"""
+"""Vosper — Audio utility functions (zero-copy, PyAV-optimized)
+
+P2 Optimisation: Pre-allocate a single numpy output buffer sized for
+AUDIO_PREALLOCATE_SAMPLES (default 300 s × 16 kHz = 4.8 M samples ≈ 18 MB).
+Frames are written into the buffer with a running pointer; only ONE final
+slice/copy is made at the end instead of the previous per-frame list + single
+concatenate.  For short audio the pre-allocation is near-zero cost; for long
+audio it avoids repeated list-append overhead and the GC churn from keeping
+all intermediate ndarrays alive until concat.
+"""
 import io
 import logging
 import wave
 
 import numpy as np
 import av
+
+from . import config
 
 log = logging.getLogger("vosper.audio")
 
@@ -30,17 +41,20 @@ def pcm_to_wav(pcm: bytes, sample_rate: int = 16000) -> bytes:
 
 def pcm_to_float32(pcm: bytes) -> np.ndarray:
     """Zero-copy conversion: int16 PCM bytes → float32 numpy array."""
-    # view as int16 then in-place divide — single allocation
     arr = np.frombuffer(pcm, dtype=np.int16)
     return arr.astype(np.float32, copy=False) * (1.0 / 32768.0)
 
 
-# ── PyAV extraction (zero-copy, returns numpy array directly) ──────────────────
+# ── PyAV extraction (pre-allocated buffer, returns numpy array directly) ───────
 
 def extract_audio_to_numpy(video_bytes: bytes, target_sr: int = 16000) -> np.ndarray:
     """
     Extract 16-kHz mono float32 numpy array from any video/audio container.
-    Zero-copy path where possible. No temp files. Returns array ready for Whisper.
+
+    P2: Uses a pre-allocated int16 buffer (AUDIO_PREALLOCATE_SAMPLES long).
+    Frames are written in-place; the buffer is sliced once at the end.
+    Falls back to dynamic list+concatenate if the audio exceeds the budget.
+    No temp files.  Returns array ready for Whisper.
     """
     try:
         input_container = av.open(io.BytesIO(video_bytes), mode="r")
@@ -59,7 +73,62 @@ def extract_audio_to_numpy(video_bytes: bytes, target_sr: int = 16000) -> np.nda
         format="s16", layout="mono", rate=target_sr,
     )
 
-    # Collect frames in a list then concatenate once — avoids per-frame tobytes()
+    # ── Pre-allocated path ─────────────────────────────────────────────────
+    preallocate = config.AUDIO_PREALLOCATE_SAMPLES
+    if preallocate > 0:
+        buf      = np.empty(preallocate, dtype=np.int16)
+        write_at = 0
+        overflow: list[np.ndarray] = []   # only used if audio exceeds budget
+
+        try:
+            for packet in input_container.demux(audio_stream):
+                for frame in packet.decode():
+                    resampled = resampler.resample(frame)
+                    for rframe in resampled:
+                        nd = rframe.to_ndarray()
+                        if nd.ndim > 1:
+                            nd = nd.reshape(-1)
+                        n = nd.size
+                        end = write_at + n
+                        if end <= preallocate:
+                            buf[write_at:end] = nd
+                            write_at = end
+                        else:
+                            # Spilled — switch to overflow list
+                            overflow.append(nd)
+
+            # Flush resampler
+            for rframe in resampler.resample(None):
+                nd = rframe.to_ndarray()
+                if nd.ndim > 1:
+                    nd = nd.reshape(-1)
+                n = nd.size
+                end = write_at + n
+                if end <= preallocate and not overflow:
+                    buf[write_at:end] = nd
+                    write_at = end
+                else:
+                    overflow.append(nd)
+
+        except Exception as exc:
+            raise RuntimeError(f"PyAV decode/resample failed: {exc}")
+        finally:
+            input_container.close()
+
+        if write_at == 0 and not overflow:
+            return np.array([], dtype=np.float32)
+
+        if overflow:
+            # Rare: audio longer than AUDIO_PREALLOCATE_SAMPLES
+            parts = [buf[:write_at]] + overflow
+            pcm_int16 = np.concatenate(parts)
+        else:
+            # Happy path: single slice, no copy needed beyond the view
+            pcm_int16 = buf[:write_at]
+
+        return pcm_int16.astype(np.float32, copy=False) * (1.0 / 32768.0)
+
+    # ── Dynamic fallback (AUDIO_PREALLOCATE_SAMPLES=0) ─────────────────────
     frames: list[np.ndarray] = []
     total_samples = 0
 
@@ -68,14 +137,12 @@ def extract_audio_to_numpy(video_bytes: bytes, target_sr: int = 16000) -> np.nda
             for frame in packet.decode():
                 resampled = resampler.resample(frame)
                 for rframe in resampled:
-                    nd = rframe.to_ndarray()  # shape: (channels, samples) or (samples,)
-                    # Flatten if needed — mono so should be 1D already
+                    nd = rframe.to_ndarray()
                     if nd.ndim > 1:
                         nd = nd.reshape(-1)
                     frames.append(nd)
                     total_samples += nd.size
 
-        # Flush
         for rframe in resampler.resample(None):
             nd = rframe.to_ndarray()
             if nd.ndim > 1:
@@ -91,7 +158,6 @@ def extract_audio_to_numpy(video_bytes: bytes, target_sr: int = 16000) -> np.nda
     if not frames:
         return np.array([], dtype=np.float32)
 
-    # Single concatenation + in-place normalization
     pcm_int16 = np.concatenate(frames)
     return pcm_int16.astype(np.float32, copy=False) * (1.0 / 32768.0)
 
