@@ -4,12 +4,12 @@ Uses j-hartmann/emotion-english-distilroberta-base
 7 classes: anger, disgust, fear, joy, neutral, sadness, surprise
 ~300MB, CPU-only, no compilation needed.
 
-Improvements over v18:
-  • Reliability threshold raised to 0.55 (was 0.45) — consistent with audio.
-  • Minimum word count for reliability raised to 4 (was 3).
-  • Long-text chunking: transcripts > 512 tokens are split into 256-token
-    overlapping chunks; scores are averaged before returning.  Previously,
-    text was silently truncated at 512 chars, discarding the second half.
+Changes:
+  • No overlapping hop — chunks are purely sequential (no overlap)
+    Each word is processed exactly ONCE
+  • Chunk size kept at 80 words for token safety
+  • Reliability threshold kept at 0.55
+  • Minimum word count for reliability kept at 4
 """
 import logging
 import time
@@ -25,9 +25,10 @@ log = logging.getLogger("auris.text_emotion")
 _RELIABLE_THRESHOLD = 0.55
 _MIN_WORDS_RELIABLE = 4
 
-# Chunking for long transcripts
+# Chunking — sequential, no overlap
+# Each chunk = 80 words, next chunk starts at word 81 (no overlap)
 _CHUNK_WORDS = 80    # ~256 tokens at ~3.2 chars/token
-_CHUNK_HOP   = 60    # 25-word overlap between chunks
+# _CHUNK_HOP removed — we use pure sequential chunking now
 
 
 def load_text_emotion_model():
@@ -38,40 +39,45 @@ def load_text_emotion_model():
 
 def _build_chunks(text: str) -> list[str]:
     """
-    Split transcript into word-based overlapping chunks so we never silently
-    discard content.  If the text fits in _CHUNK_WORDS words, return as-is.
+    Split transcript into purely sequential non-overlapping chunks.
+    Each word appears in exactly ONE chunk.
+    If text fits in _CHUNK_WORDS words, return as single chunk.
+
+    Example for 200 words with _CHUNK_WORDS=80:
+      chunk 1: words  0-79
+      chunk 2: words 80-159
+      chunk 3: words 160-199
     """
     words = text.split()
     if len(words) <= _CHUNK_WORDS:
         return [text]
 
     chunks = []
-    start = 0
-    while start < len(words):
+    # Step = _CHUNK_WORDS → no overlap, purely sequential
+    for start in range(0, len(words), _CHUNK_WORDS):
         chunk = " ".join(words[start: start + _CHUNK_WORDS])
         chunks.append(chunk)
-        start += _CHUNK_HOP
     return chunks
 
 
 def _run_pipe(pipe, chunks: list[str]) -> list[dict]:
     """
     Run the HuggingFace pipeline on every chunk and average the per-label
-    probabilities.  Returns a list of {label, score} dicts for the final
-    averaged distribution.
+    probabilities across all chunks.
+    Returns a list of {label, score} dicts for the averaged distribution.
     """
     import numpy as np
 
     label_accum: dict[str, list[float]] = {}
 
     for chunk in chunks:
-        raw = pipe(chunk)                              # chunking already keeps each chunk within token limit
+        raw = pipe(chunk)
         scores = raw[0] if isinstance(raw[0], list) else raw
         for item in scores:
             lbl = item["label"].lower()
             label_accum.setdefault(lbl, []).append(float(item["score"]))
 
-    # Average across chunks
+    # Average across all chunks
     averaged = [
         {"label": lbl, "score": float(np.mean(vals))}
         for lbl, vals in label_accum.items()
@@ -83,7 +89,9 @@ def detect_emotion_from_text(text: str) -> dict:
     """
     Detect emotion from transcript text using DistilRoBERTa.
 
-    Long transcripts are split into overlapping chunks; scores are averaged.
+    Text is split into purely sequential non-overlapping 80-word chunks.
+    Each word is processed exactly once.
+    Scores are averaged across all chunks.
     Reliability requires confidence >= 0.55 AND word_count >= 4.
     """
     _not_available = {
@@ -116,7 +124,7 @@ def detect_emotion_from_text(text: str) -> dict:
 
         all_probs = {item["label"]: round(float(item["score"]), 4) for item in scores}
 
-        best        = max(scores, key=lambda x: x["score"])
+        best          = max(scores, key=lambda x: x["score"])
         emotion_label = best["label"].lower()
         confidence    = round(float(best["score"]), 4)
         is_reliable   = confidence >= _RELIABLE_THRESHOLD and word_count >= _MIN_WORDS_RELIABLE
@@ -124,7 +132,7 @@ def detect_emotion_from_text(text: str) -> dict:
         latency_ms = round((time.perf_counter() - t_start) * 1000)
 
         log.info(
-            "Text emotion: %s (%.1f%%) [%s] | %dms | %d words | %d chunk(s)",
+            "Text emotion: %s (%.1f%%) [%s] | %dms | %d words | %d chunk(s) (no overlap)",
             emotion_label.upper(), confidence * 100,
             "reliable" if is_reliable else "low-confidence",
             latency_ms, word_count, len(chunks),

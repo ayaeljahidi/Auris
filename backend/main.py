@@ -6,7 +6,6 @@ Pipeline: Whisper || Audio Emotion (T=0)
 """
 import asyncio
 import logging
-import queue
 import time
 from concurrent.futures import ThreadPoolExecutor, Future, wait as _wait, ALL_COMPLETED
 from pathlib import Path
@@ -23,12 +22,10 @@ from .transcribe import (
     transcribe_whisper,
     transcribe_whisper_with_correction,
     transcribe_whisper_with_correction_and_emotion,
-    _whisper_producer,
-    _flan_consumer,
+    _whisper_flan_streaming_producer,
     _run_audio_emotion,
     _run_text_emotion,
     _run_qg,
-    _SENTINEL,
     FUSION_AVAILABLE,
     _correct_batch,
     _chunk_by_tokens,
@@ -215,88 +212,48 @@ def _live_pipeline(audio: np.ndarray) -> tuple[dict, dict, dict, dict]:
     OPTIMIZED 5-way pipeline for the WebSocket live endpoint.
 
     Same optimized dependency graph as /transcribe:
-      Phase 1: Whisper || Audio Emotion
-      Phase 2: Text Emotion (raw) || Flan
-      Phase 3: Fusion || QG
+      Phase 1: Whisper+Flan (streaming) || Audio Emotion
+      Phase 2: Text Emotion (corrected) || QG
+      Phase 3: Fusion
     """
     t0 = time.perf_counter()
 
     MAX_SEGS = 256
     results = [None] * MAX_SEGS
     flan_stats = {"corrected": 0, "kept": 0}
-    seg_queue: queue.Queue = queue.Queue(maxsize=0)
 
     with ThreadPoolExecutor(max_workers=5) as executor:
-        # ── PHASE 1: Whisper + Audio Emotion (parallel) ──────────────────
+        # ── PHASE 1: Whisper+Flan streaming + Audio Emotion (parallel) ───
         future_audio_emotion = executor.submit(_run_audio_emotion, audio)
-        future_whisper = executor.submit(_whisper_producer, audio, seg_queue)
+        future_whisper = executor.submit(
+            _whisper_flan_streaming_producer, audio, results, flan_stats
+        )
 
-        # Wait for Whisper
-        future_whisper.result()
+        # Wait for Whisper+Flan — returns (raw_text, corrected_text, segments)
+        raw_text, corrected_text, segments = future_whisper.result()
         t_whisper_ms = round((time.perf_counter() - t0) * 1000)
-
-        # Drain queue to get raw_text
-        queue_items: list = []
-        raw_parts: list[str] = []
-        segments: list[dict] = []
-        while True:
-            item = seg_queue.get()
-            if item is _SENTINEL:
-                break
-            queue_items.append(item)
-            idx, seg_dict, raw_text, needs_corr = item
-            results[idx] = (seg_dict, raw_text, raw_text)
-            raw_parts.append(raw_text)
-            segments.append(seg_dict)
-
-        raw_text = " ".join(raw_parts).strip()
         total_segs = len(segments)
 
-        # ── PHASE 2: Text Emotion (raw) + Flan (parallel) ──────────────────
+        # ── PHASE 2: Text Emotion + QG (parallel, on corrected_text) ────
         t_phase2 = time.perf_counter()
+        future_text_emotion = executor.submit(_run_text_emotion, corrected_text)
 
-        future_text_emotion = executor.submit(_run_text_emotion, raw_text)
+        future_qg: Future = (
+            executor.submit(_run_qg, corrected_text)
+            if _QG_ENABLED_LIVE
+            else executor.submit(lambda: {
+                "enabled": False, "questions": [], "raw": "",
+                "latency_ms": 0, "error": "skipped (live mode)",
+            })
+        )
 
-        # Flan correction (in-thread, queue already drained)
-        if config.FLAN_ENABLED:
-            model, tokenizer = load_flan()
-            if model is not None and tokenizer is not None:
-                device = next(model.parameters()).device
-
-                needs: list = []
-                keeps: list = []
-                for idx, seg_dict, raw_text, needs_correction in queue_items:
-                    if needs_correction:
-                        needs.append((idx, seg_dict, raw_text))
-                    else:
-                        keeps.append((idx, seg_dict, raw_text))
-                        flan_stats["kept"] += 1
-
-                if needs:
-                    raw_texts = [raw for _, _, raw in needs]
-                    corrected_s = _correct_batch(raw_texts, model, tokenizer, device)
-                    for (idx, seg_dict, raw_text), corrected in zip(needs, corrected_s):
-                        changed = corrected != raw_text.strip()
-                        flan_stats["corrected"] += int(changed)
-                        flan_stats["kept"] += int(not changed)
-                        results[idx] = (seg_dict, raw_text, corrected)
-
-                for idx, seg_dict, raw_text in keeps:
-                    results[idx] = (seg_dict, raw_text, raw_text.strip())
-
-        t_flan_ms = round((time.perf_counter() - t_phase2) * 1000)
-
-        # Build corrected_text
-        ordered = [r for r in results if r is not None]
-        corrected_parts = [corrected for _, _, corrected in ordered]
-        corrected_text = " ".join(corrected_parts).strip()
-
-        # ── PHASE 3: Fusion + QG (parallel) ──────────────────────────────
-        t_phase3 = time.perf_counter()
-
-        _wait([future_audio_emotion, future_text_emotion], return_when=ALL_COMPLETED)
+        _wait([future_audio_emotion, future_text_emotion, future_qg], return_when=ALL_COMPLETED)
         audio_emotion_data = future_audio_emotion.result()
         text_emotion_data = future_text_emotion.result()
+        qg_data = future_qg.result()
+
+        # ── PHASE 3: Fusion ───────────────────────────────────────────────
+        t_phase3 = time.perf_counter()
 
         # Fusion (fast, in-thread)
         if FUSION_AVAILABLE:
@@ -309,17 +266,6 @@ def _live_pipeline(audio: np.ndarray) -> tuple[dict, dict, dict, dict]:
                 "audio_emotion": audio_emotion_data,
                 "text_emotion": text_emotion_data,
             }
-
-        # QG (in thread, async HTTP inside)
-        future_qg: Future = (
-            executor.submit(_run_qg, corrected_text)
-            if _QG_ENABLED_LIVE
-            else executor.submit(lambda: {
-                "enabled": False, "questions": [], "raw": "",
-                "latency_ms": 0, "error": "skipped (live mode)",
-            })
-        )
-        qg_data = future_qg.result()
 
     t_pipeline = round((time.perf_counter() - t0) * 1000)
 

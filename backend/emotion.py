@@ -1,15 +1,13 @@
 """Auris — Speech Emotion Recognition using Wav2Vec2
 
-Enhancements over v18:
-  • Segment-level pooling  — audio is split into overlapping 3-second windows;
-    per-segment softmax probabilities are averaged before picking the winner.
-    This prevents a single loud/noisy moment from dominating the prediction.
-  • calm → neutral collapse — the two classes overlap heavily in Wav2Vec2's
-    embedding space.  Calm probability is folded into neutral before the final
-    decision, reducing the 8-class confusion to 7 meaningful categories that
-    align with the text-emotion model.
-  • Reliability threshold raised to 0.55 (was 0.50) — reduces false-confident
-    predictions on ambiguous audio.
+Changes:
+  • Window size increased to 5 seconds (was 3s) — better context per segment
+  • No hop — segments are purely sequential (no overlap)
+    [0s-5s], [5s-10s], [10s-15s], ...
+  • No _MAX_SEGS cap — ALL segments are processed
+  • Batched inference kept for efficiency
+  • calm → neutral collapse kept
+  • Reliability threshold kept at 0.55
 
 Label set after collapsing:
   angry · disgust · fear · happy · neutral (+ calm) · sad · surprised
@@ -35,13 +33,19 @@ _NEUTRAL_IDX = _RAW_LABELS.index("neutral")
 EMOTION_LABELS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprised"]
 
 # Segment settings
-_SEG_LEN_S   = 3      # window length in seconds
-_SEG_HOP_S   = 2.0    # hop between windows (was 1.5s — fewer segs, same coverage)
-_MIN_SEG_S   = 0.5    # windows shorter than this are skipped
-_MAX_SEGS    = 20     # cap: beyond 20 segs accuracy barely improves but cost soars
+# Window increased to 5s — better emotion context, fewer segments
+# Hop = window size → pure sequential, zero overlap
+# No _MAX_SEGS cap → process ALL segments
+_SEG_LEN_S = 5      # window length in seconds (increased from 3s)
+_SEG_HOP_S = 5.0    # hop = window size → no overlap, pure sequential
+_MIN_SEG_S = 0.5    # windows shorter than this are skipped (tail handling)
 
-# Raised reliability threshold (was 0.50)
+# Reliability threshold
 _RELIABLE_THRESHOLD = 0.55
+
+# Batch size for inference — process segments in groups to avoid memory issues
+_INFER_BATCH_SIZE = 16
+
 
 def _get_persistent_model():
     """Delegate to models.py — single source of truth, no duplicate load."""
@@ -51,33 +55,45 @@ def _get_persistent_model():
 
 
 def _infer_batch(model, processor, segments: list[np.ndarray], sr: int) -> list[np.ndarray]:
-    """Run all segments in ONE batched forward pass → list of (8,) numpy arrays."""
-    try:
-        inputs = processor(
-            segments,
-            sampling_rate=sr,
-            return_tensors="pt",
-            padding=True,
-        )
-        with torch.no_grad():
-            logits = model(**inputs).logits          # (N, 8)
-            probs  = torch.nn.functional.softmax(logits, dim=1)  # (N, 8)
-        return [probs[i].numpy() for i in range(probs.shape[0])]
-    except Exception as exc:
-        log.warning("Batch inference failed, falling back to single: %s", exc)
-        results = []
-        for seg in segments:
-            try:
-                inp = processor(seg, sampling_rate=sr, return_tensors="pt", padding=True)
-                with torch.no_grad():
-                    lg = model(**inp).logits
-                    p  = torch.nn.functional.softmax(lg, dim=1).squeeze()
-                if p.dim() == 0:
-                    p = p.unsqueeze(0)
-                results.append(p.numpy())
-            except Exception as e2:
-                log.warning("Single segment inference failed: %s", e2)
-        return results
+    """
+    Run all segments in batched forward passes → list of (8,) numpy arrays.
+    Processes _INFER_BATCH_SIZE segments at a time to avoid memory issues
+    on long audio (e.g. 10 min = ~120 segments).
+    """
+    all_results = []
+
+    # Process in sub-batches of _INFER_BATCH_SIZE
+    for batch_start in range(0, len(segments), _INFER_BATCH_SIZE):
+        batch = segments[batch_start: batch_start + _INFER_BATCH_SIZE]
+        try:
+            inputs = processor(
+                batch,
+                sampling_rate=sr,
+                return_tensors="pt",
+                padding=True,
+            )
+            with torch.no_grad():
+                logits = model(**inputs).logits          # (N, 8)
+                probs  = torch.nn.functional.softmax(logits, dim=1)  # (N, 8)
+            all_results.extend([probs[i].numpy() for i in range(probs.shape[0])])
+
+        except Exception as exc:
+            log.warning("Batch inference failed at batch %d, falling back to single: %s",
+                        batch_start, exc)
+            # Fallback: process one by one
+            for seg in batch:
+                try:
+                    inp = processor(seg, sampling_rate=sr, return_tensors="pt", padding=True)
+                    with torch.no_grad():
+                        lg = model(**inp).logits
+                        p  = torch.nn.functional.softmax(lg, dim=1).squeeze()
+                    if p.dim() == 0:
+                        p = p.unsqueeze(0)
+                    all_results.append(p.numpy())
+                except Exception as e2:
+                    log.warning("Single segment inference failed: %s", e2)
+
+    return all_results
 
 
 def _collapse_calm(probs8: np.ndarray) -> dict:
@@ -98,12 +114,13 @@ def _collapse_calm(probs8: np.ndarray) -> dict:
 
 def detect_emotion_global(audio: np.ndarray, sr: int = 16000) -> dict:
     """
-    Detect emotion from audio using segment-level probability pooling.
+    Detect emotion from audio using full sequential segment processing.
 
     Steps:
       1. Normalise + resample to 16 kHz
-      2. Split into overlapping 3-second windows (1.5 s hop)
-      3. Run Wav2Vec2 on each window → 8-class softmax
+      2. Split into pure sequential 5-second windows (no overlap, no skip)
+         [0s-5s], [5s-10s], [10s-15s], ...
+      3. Run Wav2Vec2 on ALL windows in batches of _INFER_BATCH_SIZE
       4. Average probabilities across all windows
       5. Collapse calm → neutral → 7-class output
       6. Pick winner; flag reliable when confidence >= 0.55
@@ -140,16 +157,15 @@ def detect_emotion_global(audio: np.ndarray, sr: int = 16000) -> dict:
         audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
         sr = 16000
 
-    # No hard cap — segment pooling handles any duration efficiently
-
-    # ── Build segments ─────────────────────────────────────────────────────
-    seg_len = int(_SEG_LEN_S * sr)
-    hop_len = int(_SEG_HOP_S * sr)
-    min_len = int(_MIN_SEG_S * sr)
+    # ── Build sequential segments (no overlap, no cap) ─────────────────────
+    seg_len = int(_SEG_LEN_S * sr)   # 5s × 16000 = 80000 samples
+    hop_len = int(_SEG_HOP_S * sr)   # same as seg_len → no overlap
+    min_len = int(_MIN_SEG_S * sr)   # 0.5s minimum to skip tail noise
     n_audio = len(audio)
 
     segments = []
     if n_audio <= seg_len:
+        # Audio shorter than one window → use as-is
         segments.append(audio)
     else:
         start = 0
@@ -157,16 +173,14 @@ def detect_emotion_global(audio: np.ndarray, sr: int = 16000) -> dict:
             seg = audio[start: start + seg_len]
             if len(seg) >= min_len:
                 segments.append(seg)
-            start += hop_len
+            start += hop_len   # hop = seg_len → pure sequential
 
-    # Cap to _MAX_SEGS — evenly sample across the audio so we keep coverage
-    if len(segments) > _MAX_SEGS:
-        indices  = np.linspace(0, len(segments) - 1, _MAX_SEGS, dtype=int)
-        segments = [segments[i] for i in indices]
+    log.debug(
+        "Processing ALL %d segments (%.1fs audio, %ds windows, no overlap)",
+        len(segments), duration_sec, _SEG_LEN_S,
+    )
 
-    log.debug("Running %d segments over %.1fs audio (batched)", len(segments), duration_sec)
-
-    # ── Batched inference ─────────────────────────────────────────────────
+    # ── Batched inference (ALL segments, _INFER_BATCH_SIZE at a time) ──────
     t_infer   = time.perf_counter()
     seg_probs = _infer_batch(model, processor, segments, sr)
     infer_ms  = round((time.perf_counter() - t_infer) * 1000)
@@ -187,7 +201,7 @@ def detect_emotion_global(audio: np.ndarray, sr: int = 16000) -> dict:
     speed_ratio = duration_sec / (latency_ms / 1000) if latency_ms > 0 else 0.0
 
     log.info(
-        "Emotion: %s (%.1f%%) [%s] | %d segs | %dms | %.1fx realtime",
+        "Emotion: %s (%.1f%%) [%s] | %d segs (all processed) | %dms | %.1fx realtime",
         best_label.upper(), confidence * 100,
         "reliable" if is_reliable else "low-confidence",
         len(seg_probs), latency_ms, speed_ratio,
