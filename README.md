@@ -1,107 +1,133 @@
-.venv\Scripts\activate  
-pip install modelscope[audio] -f https://modelscope.oss-cn-beijing.aliyuncs.com/releases/repo.html
-python scripts/setup_models.py 
-uvicorn backend.main:app --reload --port 8000 --reload-dir backend
+# Auris — High-Performance Multi-Modal Speech Analysis
 
-# Auris — Speech Analysis App
+Auris is a state-of-the-art speech analysis platform designed for real-time and batch processing. It combines high-speed transcription, contextual grammar correction, dual-source emotion fusion, and automated question generation into a single, optimized pipeline.
 
-## Project Structure
+Built for efficiency on CPU-only environments, Auris utilizes a parallelized architecture to deliver comprehensive multi-modal insights with minimal latency.
 
-```
-project/
-├── backend/          ← FastAPI Python package
-│   ├── __init__.py
-│   ├── main.py       ← FastAPI app (fixed WS endpoint)
-│   ├── audio.py      ← PyAV audio extraction
-│   ├── config.py     ← Environment config
-│   ├── emotion.py    ← Wav2Vec2 emotion detection
-│   ├── models.py     ← Model singletons
-│   ├── transcribe.py ← Whisper + Flan-T5 pipeline
-│   └── qwen_questions.py ← Qwen QG via Ollama
-├── frontend/         ← React + Tailwind (Vite)
-│   ├── src/
-│   │   ├── sections/
-│   │   │   ├── UploadPage.tsx   ← fixed: uses /transcribe (relative)
-│   │   │   └── LivePage.tsx     ← fixed: uses /ws/live (relative, protocol-aware)
-│   │   └── ...
-│   └── vite.config.ts           ← fixed: proxy to backend
-└── requirements.txt
-```
+---
 
-## What Was Fixed
+## 🚀 Key Features
 
-### 1. `backend/main.py` — WebSocket live endpoint (critical bug)
-The browser's `MediaRecorder` sends **audio/webm** (Opus-encoded), NOT raw int16 PCM.
-The original code did `np.frombuffer(data, dtype=np.int16)` on the compressed webm
-bytes, which produced garbage audio and silent/empty Whisper results.
+### 1. Advanced Transcription & Correction
+*   **Whisper ASR:** Powered by `faster-whisper` for low-latency, quantized speech-to-text.
+*   **Correction-as-a-Service:** Uses `Flan-T5` to monitor and correct grammar, spelling, and contextual nuances in real-time or batch modes.
 
-**Fix:** Accumulate all webm chunks into a buffer, then on `__END__` decode the
-reassembled webm container with `extract_audio_to_numpy()` via PyAV — exactly the
-same code path used by the `/transcribe` endpoint.
+### 2. Dual-Source Emotion Fusion
+Auris doesn't just look at what is said, but *how* it is said. It merges two distinct emotional signals:
+*   **Audio Emotion (Wav2Vec2):** Analyzes non-verbal cues (tone, pitch, energy) directly from the raw waveform.
+*   **Text Emotion (DistilRoBERTa):** Performs semantic analysis on the transcript to detect emotional intent from the words.
+*   **Adaptive Fusion Layer:** Intelligently weighs both signals, rewarding consensus and penalizing low-confidence disagreements.
 
-### 2. `backend/__init__.py` — missing package marker
-The backend uses relative imports (`from .audio import …`) so it must be a Python
-package. Without `__init__.py` you get `ImportError: attempted relative import with
-no known parent package`.
+### 3. Intelligent Question Generation
+*   **Qwen-2.5 Integration:** Analyzes the final transcript via Ollama (Qwen-2.5:1.5b) to generate relevant follow-up questions or insights based on the conversation context.
 
-**Fix:** Added `backend/__init__.py`.
+### 4. Interactive Frontend
+*   **Live Recording:** Real-time WebSocket-based audio capture with visual feedback.
+*   **Analysis Dashboard:** Visual representation of transcripts, emotion scores, and generated questions with smooth GSAP animations and 3D terrain visuals.
 
-### 3. `frontend/vite.config.ts` — no dev proxy
-The frontend had `fetch('http://localhost:8000/transcribe')` hardcoded. This fails
-whenever the ports differ, in production builds, or behind a reverse proxy.
+---
 
-**Fix:** Added a Vite `server.proxy` config that forwards `/transcribe`, `/emotion`,
-`/health`, and `/ws/live` to `localhost:8000`. The frontend code now uses relative
-paths (`/transcribe`, `/ws/live`).
+## 🧠 Pipeline Architecture
 
-### 4. `frontend/src/sections/UploadPage.tsx` — hardcoded URL
-Changed `http://localhost:8000/transcribe` → `/transcribe`.
+The system operates using a **3-Phase Dependency Graph** to maximize hardware utilization:
 
-### 5. `frontend/src/sections/LivePage.tsx` — hardcoded WS URL
-Changed `ws://localhost:8000/ws/live` → dynamic `${wsProtocol}//${window.location.host}/ws/live`
-so it works over HTTPS/WSS in production too.
+1.  **Phase 1: Feature Extraction (T=0)**
+    *   As soon as audio is received, **Whisper ASR** and **Audio Emotion** analysis launch concurrently.
+2.  **Phase 2: Contextual Analysis**
+    *   Triggered once the raw transcript is available. **Text Emotion** analysis and **Flan-T5 Correction** run in parallel.
+3.  **Phase 3: Insight Generation**
+    *   The **Emotion Fusion** layer merges the results, and **Qwen QG** generates follow-up questions.
 
-## Setup
+---
 
-### Backend
+## 🛠 Tech Stack
 
+### Backend (Python/FastAPI)
+*   **Framework:** FastAPI
+*   **Models:** Faster-Whisper, Flan-T5, Wav2Vec2, DistilRoBERTa, Qwen-2.5 (via Ollama)
+*   **Processing:** PyAV, NumPy, Torch, Transformers
+
+### Frontend (React/TypeScript)
+*   **Framework:** React 19 + Vite
+*   **Styling:** Tailwind CSS + Shadcn/UI
+*   **Visuals:** Three.js (@react-three/fiber), GSAP, Lenis (Smooth Scroll)
+
+---
+
+## 📦 Installation & Setup
+
+### Prerequisites
+*   Python 3.10+
+*   Node.js (v18+)
+*   [Ollama](https://ollama.com/) (for Question Generation)
+
+### 1. Backend Setup
 ```bash
-# Create virtualenv (recommended)
+# Create and activate a virtual environment
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+# Windows: .venv\Scripts\activate | Linux: source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Optional: install Ollama for question generation
-# https://ollama.com — then: ollama pull qwen2.5:1.5b
+# Download and cache models (Whisper, Flan, Emotion models)
+python scripts/setup_models.py
 
-# Start the backend (from project root, so `backend` is the package)
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+# Pull the Qwen model
+ollama pull qwen2.5:1.5b
 ```
 
-### Frontend
-
+### 2. Frontend Setup
 ```bash
 cd frontend
 npm install
-npm run dev        # dev server at http://localhost:3000
-# or
-npm run build      # production build → frontend/dist/
+cd ..
 ```
 
-When running `npm run dev`, Vite proxies all `/transcribe`, `/emotion`, `/health`,
-and `/ws/live` requests to the FastAPI server at `localhost:8000`.
+---
 
-For production, copy `frontend/dist/` next to the backend — FastAPI serves it via
-`StaticFiles` from `frontend/dist/`.
+## 🚀 Running the Application
 
-## Environment Variables (optional)
+To run the full stack, you will need two terminal windows:
+
+**Terminal 1: Backend**
+```bash
+uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+**Terminal 2: Frontend**
+```bash
+cd frontend
+npm run dev
+```
+The application will be available at `http://localhost:3000`.
+
+---
+
+## ⚙️ Configuration
+
+Environment variables can be set in `backend/config.py` or passed via CLI:
 
 | Variable | Default | Description |
 |---|---|---|
-| `WHISPER_MODEL` | `base.en` | Whisper model size |
-| `FLAN_ENABLED` | `true` | Enable Flan-T5 correction |
-| `FLAN_ENABLED_LIVE` | `false` | Enable Flan-T5 in live mode |
-| `EMOTION_ENABLED` | `true` | Enable emotion detection |
-| `QG_ENABLED_LIVE` | `true` | Enable question generation in live mode |
+| `WHISPER_MODEL` | `base.en` | Whisper model size (tiny.en, base.en, small.en) |
+| `FLAN_ENABLED` | `true` | Enable Flan-T5 grammar correction |
+| `EMOTION_ENABLED` | `true` | Enable the dual-emotion pipeline |
+| `EMOTION_AUDIO_WEIGHT`| `0.5` | Weight for audio-based emotion (0.0 to 1.0) |
+| `EMOTION_TEXT_WEIGHT` | `0.5` | Weight for text-based emotion (0.0 to 1.0) |
+
+---
+
+## 📂 Project Structure
+
+```text
+Auris/
+├── backend/            # FastAPI source code (audio, transcription, emotion, QG)
+├── frontend/           # React frontend (Vite, Tailwind, Shadcn/UI)
+│   ├── src/sections/   # Page components (LiveRecording, Upload, Results)
+│   └── src/components/ # Reusable UI components
+├── models/             # Local cache for AI models
+├── scripts/            # Setup and utility scripts
+├── requirements.txt    # Python dependencies
+└── README.md           # This file
+```
